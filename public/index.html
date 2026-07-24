@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Roadtrip Map</title>
+<meta name="theme-color" content="#0e7490">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icons/icon-192.png">
+<link rel="apple-touch-icon" href="/icons/icon-192.png">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root {
+    --teal: #0e7490; --teal-dark: #0f2e36; --accent: #f59e0b;
+    --bg: #ffffff; --text: #0f172a; --muted: #64748b; --line: #e2e8f0;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overscroll-behavior: none; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: var(--text); background: var(--bg);
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px; padding-top: calc(10px + env(safe-area-inset-top));
+    background: var(--teal-dark); color: #fff; z-index: 1200;
+  }
+  header .logo { width: 28px; height: 28px; border-radius: 7px; flex: none; }
+  #tripSelect {
+    flex: 1; min-width: 0; font-size: 15px; font-weight: 600;
+    background: rgba(255,255,255,.12); color: #fff; border: none;
+    border-radius: 8px; padding: 8px 10px; appearance: none;
+  }
+  #tripSelect option { color: #111; }
+  header button, .btn {
+    border: none; border-radius: 8px; padding: 8px 12px; font-size: 14px;
+    font-weight: 600; cursor: pointer; flex: none;
+  }
+  .btn-icon { background: rgba(255,255,255,.12); color: #fff; font-size: 17px; line-height: 1; }
+  .btn-primary { background: var(--teal); color: #fff; }
+  .btn-warn { background: #dc2626; color: #fff; }
+  .btn-ghost { background: #f1f5f9; color: var(--text); }
+  #viewerTitle { flex: 1; font-weight: 700; font-size: 16px; display: none; }
+  main { flex: 1; position: relative; min-height: 0; }
+  #map { position: absolute; inset: 0; background: #dbeafe; }
+  /* photo strip */
+  #strip {
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 1000;
+    display: flex; gap: 8px; overflow-x: auto; padding: 10px 12px;
+    padding-bottom: calc(10px + env(safe-area-inset-bottom));
+    background: linear-gradient(transparent, rgba(15,46,54,.55));
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
+  }
+  #strip:empty { display: none; }
+  #strip::-webkit-scrollbar { display: none; }
+  .thumb {
+    width: 64px; height: 64px; flex: none; border-radius: 10px;
+    object-fit: cover; border: 2.5px solid #fff; cursor: pointer;
+    box-shadow: 0 2px 8px rgba(0,0,0,.35); background: #cbd5e1;
+  }
+  .thumb.nogps { border-color: var(--accent); opacity: .85; }
+  .thumb.active { border-color: var(--accent); transform: scale(1.06); }
+  /* marker */
+  .photo-marker {
+    width: 44px; height: 44px; border-radius: 50% 50% 50% 4px;
+    border: 3px solid #fff; box-shadow: 0 2px 6px rgba(0,0,0,.4);
+    background-size: cover; background-position: center; background-color: #94a3b8;
+  }
+  .leaflet-popup-content { margin: 8px; }
+  .popup-img { width: 200px; max-height: 200px; object-fit: cover; border-radius: 8px; display: block; cursor: pointer; }
+  .popup-cap { font-size: 12px; color: var(--muted); margin-top: 5px; }
+  /* empty state */
+  #empty {
+    position: absolute; inset: 0; z-index: 900; display: flex;
+    flex-direction: column; align-items: center; justify-content: center;
+    gap: 14px; text-align: center; padding: 24px; pointer-events: none;
+  }
+  #empty > * { pointer-events: auto; }
+  #empty .card {
+    background: #fff; border-radius: 16px; padding: 22px 20px; max-width: 340px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.18);
+  }
+  #empty h2 { font-size: 18px; margin-bottom: 8px; }
+  #empty p { font-size: 14px; color: var(--muted); line-height: 1.5; }
+  /* dialogs */
+  dialog {
+    border: none; border-radius: 16px; padding: 20px; width: min(92vw, 420px);
+    box-shadow: 0 12px 50px rgba(0,0,0,.3);
+  }
+  dialog::backdrop { background: rgba(15,23,42,.5); }
+  dialog h3 { font-size: 17px; margin-bottom: 12px; }
+  dialog p { font-size: 14px; color: var(--muted); line-height: 1.5; margin-bottom: 12px; }
+  dialog input[type=text], dialog input[type=password] {
+    width: 100%; padding: 10px 12px; font-size: 15px; border: 1.5px solid var(--line);
+    border-radius: 10px; margin-bottom: 12px;
+  }
+  .dlg-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
+  .trip-row {
+    display: flex; align-items: center; gap: 8px; padding: 9px 4px;
+    border-bottom: 1px solid var(--line); font-size: 15px;
+  }
+  .trip-row span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .trip-row small { color: var(--muted); flex: none; }
+  .trip-row button { padding: 5px 9px; font-size: 13px; }
+  #shareResult { display: none; }
+  #shareLink {
+    font-size: 13px; background: #f1f5f9; padding: 10px; border-radius: 10px;
+    word-break: break-all; margin-bottom: 10px; user-select: all;
+  }
+  /* fullscreen photo viewer */
+  #photoView {
+    position: fixed; inset: 0; z-index: 2000; background: rgba(10,15,20,.96);
+    display: none; flex-direction: column;
+  }
+  #photoView.open { display: flex; }
+  #photoView img { flex: 1; min-height: 0; object-fit: contain; width: 100%; }
+  #photoView .bar {
+    display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom)); color: #e2e8f0; font-size: 13px;
+  }
+  #photoView .bar span { flex: 1; }
+  #toast {
+    position: fixed; left: 50%; bottom: 100px; transform: translateX(-50%);
+    background: #0f172a; color: #fff; padding: 10px 18px; border-radius: 999px;
+    font-size: 14px; z-index: 3000; display: none; max-width: 88vw; text-align: center;
+    box-shadow: 0 4px 20px rgba(0,0,0,.35);
+  }
+  #busy {
+    position: fixed; inset: 0; z-index: 2500; background: rgba(255,255,255,.75);
+    display: none; align-items: center; justify-content: center; flex-direction: column; gap: 12px;
+  }
+  #busy.open { display: flex; }
+  .spinner {
+    width: 38px; height: 38px; border-radius: 50%;
+    border: 4px solid var(--line); border-top-color: var(--teal);
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #busyText { font-size: 14px; font-weight: 600; color: var(--text); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <img class="logo" src="/icons/icon-192.png" alt="">
+  <select id="tripSelect" title="Current trip"></select>
+  <div id="viewerTitle"></div>
+  <button class="btn-icon" id="btnTrips" title="Manage trips">&#9776;</button>
+  <button class="btn-icon" id="btnAdd" title="Add photos">&#65291;</button>
+  <button class="btn-icon" id="btnShare" title="Share trip">&#8599;</button>
+</header>
+<main>
+  <div id="map"></div>
+  <div id="empty" class="hidden">
+    <div class="card">
+      <h2>No photos yet</h2>
+      <p id="emptyHint">Tap <b>＋</b> to pick photos, or share photos from the
+      Google Photos app straight into <b>Roadtrip Map</b> (Share → Roadtrip Map).
+      Location and time are read from each photo automatically.</p>
+    </div>
+  </div>
+  <div id="strip"></div>
+</main>
+
+<input type="file" id="filePick" accept="image/*" multiple hidden>
+
+<dialog id="dlgTrips">
+  <h3>My trips</h3>
+  <div id="tripList"></div>
+  <div class="dlg-actions">
+    <button class="btn btn-ghost" id="btnTripsClose">Close</button>
+    <button class="btn btn-primary" id="btnNewTrip">New trip</button>
+  </div>
+</dialog>
+
+<dialog id="dlgName">
+  <h3 id="dlgNameTitle">New trip</h3>
+  <input type="text" id="tripNameInput" placeholder="e.g. Slovenia 2026" maxlength="60">
+  <div class="dlg-actions">
+    <button class="btn btn-ghost" id="btnNameCancel">Cancel</button>
+    <button class="btn btn-primary" id="btnNameOk">Save</button>
+  </div>
+</dialog>
+
+<dialog id="dlgShare">
+  <div id="shareForm">
+    <h3>Share this trip</h3>
+    <p>Publishes a copy of this trip (photos + route) to your site so family can
+    view it with a link and this password. Publishing again later updates it.</p>
+    <input type="password" id="sharePass" placeholder="Choose a password (min 4 chars)" autocomplete="new-password">
+    <div class="dlg-actions">
+      <button class="btn btn-ghost" id="btnShareCancel">Cancel</button>
+      <button class="btn btn-primary" id="btnSharePublish">Publish</button>
+    </div>
+  </div>
+  <div id="shareResult">
+    <h3>Trip published</h3>
+    <p>Send this link and the password to your family:</p>
+    <div id="shareLink"></div>
+    <div class="dlg-actions">
+      <button class="btn btn-ghost" id="btnShareClose">Close</button>
+      <button class="btn btn-primary" id="btnCopyLink">Copy link</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="dlgPass">
+  <h3 id="dlgPassTitle">Enter password</h3>
+  <p>This shared trip is password-protected.</p>
+  <input type="password" id="viewPass" placeholder="Password" autocomplete="current-password">
+  <div class="dlg-actions">
+    <button class="btn btn-primary" id="btnPassOk">Open trip</button>
+  </div>
+</dialog>
+
+<div id="photoView">
+  <img id="photoViewImg" alt="">
+  <div class="bar">
+    <span id="photoViewCap"></span>
+    <button class="btn btn-warn" id="btnPhotoDelete">Delete</button>
+    <button class="btn btn-ghost" id="btnPhotoClose">Close</button>
+  </div>
+</div>
+
+<div id="busy"><div class="spinner"></div><div id="busyText">Working…</div></div>
+<div id="toast"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/exifr@7.1.3/dist/full.umd.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
