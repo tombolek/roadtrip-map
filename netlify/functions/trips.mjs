@@ -1,14 +1,20 @@
 /* Roadtrip Map — trip sharing API (Netlify Function + Netlify Blobs).
-   Trips are stored under trips/<id>/meta.json + trips/<id>/photos/<pid>.
-   Every read and photo upload requires the trip password (x-trip-key header),
+   Layout: trips/<id>/meta.json, trips/<id>/photos/<pid> (full-size),
+   trips/<id>/thumbs/<pid> (small thumbnails for strip + map markers).
+   Every read and upload requires the trip password (x-trip-key header),
    verified against a salted PBKDF2 hash stored with the trip. */
 import { getStore } from "@netlify/blobs";
 
 export const config = {
-  path: ["/api/trips", "/api/trips/:id", "/api/trips/:id/photos/:pid"],
+  path: [
+    "/api/trips",
+    "/api/trips/:id",
+    "/api/trips/:id/photos/:pid",
+    "/api/trips/:id/thumbs/:pid",
+  ],
 };
 
-const MAX_PHOTO_BYTES = 5 * 1024 * 1024; // downscaled photos are well under this
+const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
 const enc = new TextEncoder();
 
 async function hashPassword(password, saltHex) {
@@ -42,6 +48,7 @@ export default async (req, context) => {
   const store = getStore("roadtrip");
   const { id, pid } = context.params ?? {};
   const headerKey = req.headers.get("x-trip-key") || "";
+  const kind = new URL(req.url).pathname.includes("/thumbs/") ? "thumbs" : "photos";
 
   /* ---- POST /api/trips — publish new or update existing ---- */
   if (req.method === "POST" && !id) {
@@ -62,16 +69,17 @@ export default async (req, context) => {
 
     let outId, salt, hash;
     if (tripId) {
-      // update: password must match the existing trip
       const auth = await requireAuth(store, String(tripId), password);
       if (auth.err) return auth.err;
       outId = String(tripId); salt = auth.meta.salt; hash = auth.meta.hash;
-      // remove photos that no longer exist in the trip
+      // remove photos + thumbs that no longer exist in the trip
       const keep = new Set(cleanPhotos.map(p => p.id));
-      const { blobs } = await store.list({ prefix: `trips/${outId}/photos/` });
-      for (const b of blobs) {
-        const old = b.key.split("/").pop();
-        if (!keep.has(old)) await store.delete(b.key);
+      for (const prefix of ["photos", "thumbs"]) {
+        const { blobs } = await store.list({ prefix: `trips/${outId}/${prefix}/` });
+        for (const b of blobs) {
+          const old = b.key.split("/").pop();
+          if (!keep.has(old)) await store.delete(b.key);
+        }
       }
     } else {
       outId = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
@@ -95,7 +103,7 @@ export default async (req, context) => {
     return json({ name, photos, updatedAt });
   }
 
-  /* ---- PUT /api/trips/:id/photos/:pid — upload photo bytes (auth) ---- */
+  /* ---- PUT /api/trips/:id/(photos|thumbs)/:pid — upload bytes (auth) ---- */
   if (req.method === "PUT" && id && pid) {
     const auth = await requireAuth(store, id, headerKey);
     if (auth.err) return auth.err;
@@ -103,16 +111,16 @@ export default async (req, context) => {
     if (!auth.meta.photos.some(p => p.id === safePid)) return json({ error: "unknown photo" }, 400);
     const buf = await req.arrayBuffer();
     if (buf.byteLength === 0 || buf.byteLength > MAX_PHOTO_BYTES) return json({ error: "bad size" }, 413);
-    await store.set(`trips/${id}/photos/${safePid}`, buf);
+    await store.set(`trips/${id}/${kind}/${safePid}`, buf);
     return json({ ok: true });
   }
 
-  /* ---- GET /api/trips/:id/photos/:pid — photo bytes (auth) ---- */
+  /* ---- GET /api/trips/:id/(photos|thumbs)/:pid — bytes (auth) ---- */
   if (req.method === "GET" && id && pid) {
     const auth = await requireAuth(store, id, headerKey);
     if (auth.err) return auth.err;
     const safePid = String(pid).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 40);
-    const blob = await store.get(`trips/${id}/photos/${safePid}`, { type: "arrayBuffer" });
+    const blob = await store.get(`trips/${id}/${kind}/${safePid}`, { type: "arrayBuffer" });
     if (!blob) return json({ error: "not found" }, 404);
     return new Response(blob, {
       headers: { "content-type": "image/jpeg", "cache-control": "private, max-age=3600" },
