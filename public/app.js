@@ -520,6 +520,10 @@ async function startViewer(tripId) {
 
 /* ---------------- wiring ---------------- */
 async function main() {
+  if (typeof L === "undefined")
+    throw new Error("Map library failed to load — check your connection and reload");
+  if (typeof exifr === "undefined")
+    throw new Error("EXIF library failed to load — check your connection and reload");
   initMap();
 
   const viewerTripId = parseViewerHash();
@@ -578,4 +582,8 @@ async function main() {
   });
 }
 
-main().catch(e => { console.error(e); toast("Something went wrong starting the app"); });
+main().catch(e => {
+  console.error(e);
+  const msg = e && e.message ? e.message : String(e);
+  toast("Startup error: " + msg, 10000);
+});
