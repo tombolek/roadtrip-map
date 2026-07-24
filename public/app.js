@@ -481,15 +481,39 @@ async function startViewer(tripId) {
   $("viewerTitle").textContent = "Shared trip";
   $("emptyHint").innerHTML = "Enter the password to view this shared trip.";
 
+  // wire the fullscreen photo viewer's Close button (owner-mode wiring in
+  // main() never runs here because viewer mode returns early)
+  $("btnPhotoClose").onclick = closePhotoView;
+  $("photoView").addEventListener("click", ev => { if (ev.target.id === "photoView") closePhotoView(); });
+
+  // remember the password for this trip for 48h so viewers aren't re-prompted
+  const PASS_KEY = "rtpass_" + tripId, PASS_TTL = 48 * 60 * 60 * 1000;
+  const savePass = pass => {
+    try { localStorage.setItem(PASS_KEY, JSON.stringify({ pass, exp: Date.now() + PASS_TTL })); } catch {}
+  };
+  const loadSavedPass = () => {
+    try {
+      const raw = localStorage.getItem(PASS_KEY);
+      if (!raw) return null;
+      const { pass, exp } = JSON.parse(raw);
+      if (!exp || Date.now() > exp) { localStorage.removeItem(PASS_KEY); return null; }
+      return pass;
+    } catch { return null; }
+  };
+
   const dlg = $("dlgPass");
-  const tryOpen = async () => {
-    const pass = $("viewPass").value;
+  const tryOpen = async (presetPass) => {
+    const pass = presetPass ?? $("viewPass").value;
     if (!pass) return;
     busy("Loading trip…");
     try {
       const r = await fetch(`/api/trips/${tripId}`, { headers: { "x-trip-key": pass } });
-      if (r.status === 401) { busy(false); toast("Wrong password"); dlg.showModal(); return; }
+      if (r.status === 401) {
+        busy(false); localStorage.removeItem(PASS_KEY);
+        toast("Wrong password"); dlg.showModal(); return;
+      }
       if (!r.ok) throw new Error("load failed " + r.status);
+      savePass(pass);
       const data = await r.json();
       viewerMode = { id: tripId, pass, name: data.name };
       $("viewerTitle").textContent = data.name;
@@ -522,7 +546,11 @@ async function startViewer(tripId) {
   };
   $("btnPassOk").onclick = () => { dlg.close(); tryOpen(); };
   $("viewPass").onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); dlg.close(); tryOpen(); } };
-  dlg.showModal();
+
+  // if we already have a valid saved password, open straight away
+  const saved = loadSavedPass();
+  if (saved) tryOpen(saved);
+  else dlg.showModal();
 }
 
 /* ---------------- wiring ---------------- */
