@@ -4,7 +4,7 @@
    2. Caches the app shell + CDN libs for offline use. */
 "use strict";
 
-const CACHE = "roadtrip-v2";
+const CACHE = "roadtrip-v3";
 const SHELL = [
   "/", "/index.html", "/app.js", "/manifest.webmanifest",
   "/icons/icon-192.png", "/icons/icon-512.png",
@@ -71,7 +71,20 @@ self.addEventListener("fetch", e => {
     e.respondWith((async () => {
       try {
         const form = await e.request.formData();
-        const files = form.getAll("photos").filter(f => f && f.size);
+        // Collect files from every field (Files app may not use "photos"),
+        // and keep anything that looks like an image regardless of MIME type
+        // (Android often shares as application/octet-stream from Files).
+        const files = [];
+        for (const [, v] of form.entries()) {
+          if (v && typeof v === "object" && "size" in v && v.size) {
+            const type = v.type || "";
+            const name = (v.name || "").toLowerCase();
+            const looksImage = type.startsWith("image/") ||
+              /\.(jpe?g|png|heic|heif|webp|gif|bmp|tiff?)$/.test(name) ||
+              type === "" || type === "application/octet-stream";
+            if (looksImage) files.push(v);
+          }
+        }
         await stashInInbox(files);
       } catch (err) { console.error("share-target failed", err); }
       return Response.redirect("/?shared=1", 303);

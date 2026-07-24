@@ -18,7 +18,7 @@
     "enctype": "multipart/form-data",
     "params": {
       "files": [
-        { "name": "photos", "accept": ["image/jpeg", "image/png", "image/heic", "image/heif", "image/webp", "image/*"] }
+        { "name": "photos", "accept": ["image/*", "image/jpeg", "image/png", "image/heic", "image/heif", "image/webp", ".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp"] }
       ]
     }
   }
