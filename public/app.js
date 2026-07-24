@@ -253,6 +253,7 @@ function renderTripList() {
     const ren = document.createElement("button"); ren.className = "btn btn-ghost"; ren.textContent = "Rename";
     ren.onclick = () => promptName("Rename trip", t.name, async name => {
       t.name = name; await idb.put("trips", t); renderTripSelect(); renderTripList();
+      markDirtyAndSync(t.id);
     });
     const del = document.createElement("button"); del.className = "btn btn-warn"; del.textContent = "✕";
     del.onclick = () => deleteTrip(t);
@@ -285,6 +286,7 @@ async function importFiles(files) {
   busy(false);
   await loadPhotos(); renderAll();
   toast(noGps ? `Added ${ok} photos (${noGps} without location — shown in the strip only)` : `Added ${ok} photos`);
+  markDirtyAndSync(tripId);
 }
 async function drainInbox() {
   const items = await idb.all("inbox");
@@ -303,6 +305,7 @@ async function drainInbox() {
   await loadPhotos(); renderAll();
   const tripName = trips.find(t => t.id === tripId)?.name || "trip";
   toast(`Added ${ok} shared photos to “${tripName}”` + (noGps ? ` — ${noGps} had no location` : ""));
+  markDirtyAndSync(tripId);
 }
 
 /* ---------------- fullscreen photo ---------------- */
@@ -352,7 +355,7 @@ async function publishTrip(pass) {
       });
       if (!r.ok) throw new Error("photo upload failed: " + r.status);
     }
-    trip.published = { id, password: pass };
+    trip.published = { id, password: pass, uploadedIds: list.map(p => p.id), dirty: false };
     await idb.put("trips", trip);
     busy(false);
     const link = `${location.origin}/#/trip/${id}`;
@@ -367,6 +370,64 @@ async function publishTrip(pass) {
     console.error(e); busy(false);
     toast("Publishing failed — is the site deployed on Netlify with the function?");
   }
+}
+
+/* ---------------- live sync of published trips ----------------
+   Once a trip is published, later changes (added/removed photos, rename)
+   are pushed to the shared copy automatically. If offline, the trip is
+   marked dirty and synced next time the app is opened/visible. */
+let syncInFlight = false;
+async function markDirtyAndSync(tripId) {
+  const trip = trips.find(t => t.id === tripId);
+  if (!trip?.published) return;
+  trip.published.dirty = true;
+  await idb.put("trips", trip);
+  syncPublishedTrip(trip);
+}
+async function syncPublishedTrip(trip) {
+  if (!trip?.published || syncInFlight) return;
+  syncInFlight = true;
+  const pub = trip.published;
+  try {
+    const list = sortPhotos(await idb.byIndex("photos", "tripId", trip.id));
+    const r = await fetch("/api/trips", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        tripId: pub.id,
+        password: pub.password,
+        name: trip.name,
+        photos: list.map(p => ({ id: p.id, name: p.name, ts: p.ts, lat: p.lat, lng: p.lng })),
+      }),
+    });
+    if (!r.ok) throw new Error("meta sync failed " + r.status);
+    const uploaded = new Set(pub.uploadedIds || []);
+    for (const p of list) {
+      if (uploaded.has(p.id)) continue;
+      const b = p.blob || p.thumb;
+      if (!b) continue;
+      const pr = await fetch(`/api/trips/${pub.id}/photos/${p.id}`, {
+        method: "PUT", headers: { "x-trip-key": pub.password, "content-type": "image/jpeg" }, body: b,
+      });
+      if (!pr.ok) throw new Error("photo sync failed " + pr.status);
+      uploaded.add(p.id);
+      pub.uploadedIds = [...uploaded];
+      await idb.put("trips", trip);
+    }
+    pub.uploadedIds = pub.uploadedIds ? pub.uploadedIds.filter(id => list.some(p => p.id === id)) : [];
+    pub.dirty = false;
+    await idb.put("trips", trip);
+    toast("Shared link updated");
+  } catch (e) {
+    console.warn("sync postponed:", e.message);
+    pub.dirty = true;
+    await idb.put("trips", trip);
+  } finally {
+    syncInFlight = false;
+  }
+}
+async function syncAllDirty() {
+  for (const t of trips) if (t.published?.dirty) await syncPublishedTrip(t);
 }
 
 /* ---------------- shared-trip viewer mode ---------------- */
@@ -440,6 +501,7 @@ async function main() {
   await loadPhotos();
   renderAll();
   await drainInbox();
+  syncAllDirty();
 
   $("tripSelect").onchange = e => switchTrip(e.target.value);
   $("btnAdd").onclick = () => $("filePick").click();
@@ -472,11 +534,13 @@ async function main() {
     closePhotoView();
     await loadPhotos(); renderAll();
     toast("Photo removed");
+    markDirtyAndSync(currentTripId);
   };
   // re-check inbox when returning to the app (e.g. right after sharing photos)
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") drainInbox();
+    if (document.visibilityState === "visible") { drainInbox(); syncAllDirty(); }
   });
+  window.addEventListener("online", () => syncAllDirty());
   navigator.serviceWorker?.addEventListener("message", ev => {
     if (ev.data === "inbox-updated") drainInbox();
   });
