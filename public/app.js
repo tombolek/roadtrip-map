@@ -193,7 +193,62 @@ function renderStrip() {
   }
   $("empty").classList.toggle("hidden", photos.length > 0);
 }
-function renderAll() { renderMap(); renderStrip(); }
+function renderAll() { renderMap(); renderStrip(); if (currentView === "gallery") renderGallery(); }
+
+/* ---------------- gallery / timeline view ---------------- */
+let currentView = "map"; // "map" | "gallery"
+function dayLabel(ts) {
+  if (!ts) return "Undated";
+  return new Date(ts).toLocaleDateString(undefined,
+    { weekday: "short", day: "numeric", month: "short", year: "numeric" });
+}
+function dayKey(ts) {
+  if (!ts) return "zzz-undated"; // sorts last
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+function renderGallery() {
+  const g = $("gallery");
+  g.innerHTML = "";
+  if (!photos.length) {
+    g.innerHTML = '<div class="gal-empty">No photos yet.</div>';
+    return;
+  }
+  // photos are already sorted ascending by time; group consecutively by day
+  let curKey = null, grid = null;
+  for (const p of photos) {
+    const k = dayKey(p.ts);
+    if (k !== curKey) {
+      curKey = k;
+      const day = document.createElement("div");
+      day.className = "gal-day";
+      const h = document.createElement("h3");
+      h.textContent = dayLabel(p.ts);
+      grid = document.createElement("div");
+      grid.className = "gal-grid";
+      day.append(h, grid);
+      g.appendChild(day);
+    }
+    const cell = document.createElement("div");
+    cell.className = "gal-cell" + (p.lat == null ? " nogps" : "");
+    cell.title = p.lat == null ? "No location in this photo" : fmtDate(p.ts);
+    const img = document.createElement("img");
+    img.src = thumbUrl(p); img.loading = "lazy"; img.alt = p.name || "photo";
+    cell.appendChild(img);
+    cell.onclick = () => openPhotoView(p);
+    grid.appendChild(cell);
+  }
+}
+function setView(view) {
+  currentView = view;
+  const gallery = view === "gallery";
+  $("gallery").classList.toggle("hidden", !gallery);
+  $("strip").style.display = gallery ? "none" : "";
+  $("tabMap").classList.toggle("active", !gallery);
+  $("tabGallery").classList.toggle("active", gallery);
+  if (gallery) renderGallery();
+  else if (map) setTimeout(() => map.invalidateSize(), 0); // map was covered; refresh tiles
+}
 
 /* ---------------- trips ---------------- */
 async function loadTrips() {
@@ -557,6 +612,10 @@ async function main() {
   if (typeof exifr === "undefined")
     throw new Error("EXIF library failed to load — check your connection and reload");
   initMap();
+
+  // Map / Gallery toggle — wired in both owner and viewer modes
+  $("tabMap").onclick = () => setView("map");
+  $("tabGallery").onclick = () => setView("gallery");
 
   const viewerTripId = parseViewerHash();
   if (viewerTripId) { await startViewer(viewerTripId); return; }

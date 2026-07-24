@@ -138,12 +138,51 @@
   }
   @keyframes spin { to { transform: rotate(360deg); } }
   #busyText { font-size: 14px; font-weight: 600; color: var(--text); }
+  /* view toggle (Map | Gallery) */
+  #viewToggle { display: flex; gap: 2px; background: rgba(255,255,255,.12); border-radius: 8px; padding: 2px; flex: none; }
+  #viewToggle .vt {
+    background: transparent; border: none; padding: 6px 9px; border-radius: 6px;
+    cursor: pointer; color: #cbd5e1; display: flex; align-items: center;
+  }
+  #viewToggle .vt.active { background: var(--teal); color: #fff; }
+  #viewToggle .vt svg { width: 18px; height: 18px; display: block; }
+  /* gallery / timeline */
+  #gallery {
+    position: absolute; inset: 0; z-index: 1100; overflow-y: auto;
+    background: #f8fafc; -webkit-overflow-scrolling: touch;
+    padding: 4px 12px calc(16px + env(safe-area-inset-bottom));
+  }
+  #gallery.hidden { display: none; }
+  .gal-day h3 {
+    font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase;
+    letter-spacing: .03em; margin: 0; padding: 14px 2px 8px; position: sticky; top: 0;
+    background: linear-gradient(#f8fafc 70%, rgba(248,250,252,0)); z-index: 1;
+  }
+  .gal-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 6px; }
+  .gal-cell {
+    position: relative; aspect-ratio: 1 / 1; border-radius: 10px; overflow: hidden;
+    background: #e2e8f0; cursor: pointer;
+  }
+  .gal-cell img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .gal-cell.nogps::after {
+    content: ""; position: absolute; top: 5px; right: 5px; width: 8px; height: 8px;
+    border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 1.5px #fff;
+  }
+  .gal-empty { text-align: center; color: var(--muted); font-size: 14px; padding: 60px 24px; }
   .hidden { display: none !important; }
 </style>
 </head>
 <body>
 <header>
   <img class="logo" src="/icons/icon-192.png" alt="">
+  <div id="viewToggle">
+    <button id="tabMap" class="vt active" title="Map view" aria-label="Map view">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/><line x1="8" y1="2" x2="8" y2="18"/><line x1="16" y1="6" x2="16" y2="22"/></svg>
+    </button>
+    <button id="tabGallery" class="vt" title="Gallery view" aria-label="Gallery view">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+    </button>
+  </div>
   <select id="tripSelect" title="Current trip"></select>
   <div id="viewerTitle"></div>
   <button class="btn-icon" id="btnTrips" title="Manage trips">&#9776;</button>
@@ -163,6 +202,7 @@
     </div>
   </div>
   <div id="strip"></div>
+  <div id="gallery" class="hidden"></div>
 </main>
 
 <!-- No accept="image/*": on Android that forces the Photos picker, which strips
