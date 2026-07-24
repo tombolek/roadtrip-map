@@ -165,7 +165,9 @@
   <div id="strip"></div>
 </main>
 
-<input type="file" id="filePick" accept="image/*" multiple hidden>
+<!-- No accept="image/*": on Android that forces the Photos picker, which strips
+     GPS. Omitting it opens the Files/document chooser so originals keep EXIF. -->
+<input type="file" id="filePick" multiple hidden>
 
 <dialog id="dlgTrips">
   <h3>My trips</h3>

@@ -272,8 +272,15 @@ function promptName(title, initial, cb) {
 }
 
 /* ---------------- import ---------------- */
+function looksLikeImage(f) {
+  const t = (f.type || "").toLowerCase();
+  const n = (f.name || "").toLowerCase();
+  return t.startsWith("image/") || t === "" || t === "application/octet-stream" ||
+    /\.(jpe?g|png|heic|heif|webp|gif|bmp|tiff?)$/.test(n);
+}
 async function importFiles(files) {
-  if (!files.length) return;
+  files = files.filter(looksLikeImage);
+  if (!files.length) { toast("No images selected"); return; }
   const tripId = await ensureTrip();
   let ok = 0, noGps = 0;
   for (let i = 0; i < files.length; i++) {
