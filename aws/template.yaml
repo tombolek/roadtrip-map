@@ -7,12 +7,13 @@ Description: >
 
 Parameters:
   CloudFrontPublicKey:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: >
+      Name of the SSM String parameter that holds the PEM public key
+      (e.g. /roadtrip/cf-public-key). CloudFormation resolves it to the PEM.
+  PrivateKeySecretArn:
     Type: String
-    Description: PEM public key (contents of public_key.pem) for signed cookies.
-  PrivateKeyPem:
-    Type: String
-    NoEcho: true
-    Description: PEM private key (contents of private_key.pem) — stored in Secrets Manager.
+    Description: ARN of the Secrets Manager secret holding the PEM private key.
   CFDomain:
     Type: String
     Default: ""
@@ -65,12 +66,6 @@ Resources:
         - AttributeName: tripId
           KeyType: HASH
 
-  # ---------------- secret (signed-cookie private key) ----------------
-  PrivateKeySecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      SecretString: !Ref PrivateKeyPem
-
   # ---------------- API Lambda ----------------
   ApiFunction:
     Type: AWS::Serverless::Function
@@ -83,7 +78,7 @@ Resources:
           MEDIA_BUCKET: !Ref MediaBucket
           CF_DOMAIN: !Ref CFDomain
           CF_KEY_PAIR_ID: !Ref SigningPublicKey
-          PRIVATE_KEY_SECRET_ARN: !Ref PrivateKeySecret
+          PRIVATE_KEY_SECRET_ARN: !Ref PrivateKeySecretArn
       FunctionUrlConfig:
         AuthType: NONE
         Cors:
@@ -98,7 +93,7 @@ Resources:
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
-              Resource: !Ref PrivateKeySecret
+              Resource: !Ref PrivateKeySecretArn
 
   # ---------------- CloudFront ----------------
   Oac:

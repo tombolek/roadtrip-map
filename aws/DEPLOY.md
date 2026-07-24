@@ -16,15 +16,43 @@ git clone https://github.com/tombolek/roadtrip-map.git
 cd roadtrip-map/aws
 ```
 
-## 2. Generate the signing key pair (for CloudFront signed cookies)
+## 2. Generate the signing key pair and store it in AWS
 
 ```bash
+# generate
 openssl genrsa -out private_key.pem 2048
 openssl rsa -pubout -in private_key.pem -out public_key.pem
+
+# store the PUBLIC key in SSM (using file:// so newlines are preserved)
+aws ssm put-parameter --name /roadtrip/cf-public-key --type String \
+  --value file://public_key.pem --overwrite
+
+# store the PRIVATE key in Secrets Manager, capture its ARN
+SECRET_ARN=$(aws secretsmanager create-secret --name roadtrip/cf-private-key \
+  --secret-string file://private_key.pem --query ARN --output text)
+echo "SECRET_ARN=$SECRET_ARN"
 ```
 
-Keep `private_key.pem` private — it never leaves CloudShell except into Secrets
-Manager, encrypted, during deploy.
+> Passing the PEM keys through the AWS CLI with `file://` is the reliable way —
+> handing multi-line keys to `sam deploy --parameter-overrides` corrupts them.
+>
+> **If you're re-running after a failure** and the secret already exists, either
+> reuse its ARN:
+> `SECRET_ARN=$(aws secretsmanager describe-secret --secret-id roadtrip/cf-private-key --query ARN --output text)`
+> and refresh its value:
+> `aws secretsmanager put-secret-value --secret-id roadtrip/cf-private-key --secret-string file://private_key.pem`
+
+Keep `private_key.pem` private — don't download it or paste it anywhere.
+
+## 2b. If a previous deploy failed and rolled back
+
+A rolled-back stack is stuck in `ROLLBACK_COMPLETE` and can't be updated — delete
+it first (its buckets were already emptied during rollback, so this is clean):
+
+```bash
+aws cloudformation delete-stack --stack-name roadtrip
+aws cloudformation wait stack-delete-complete --stack-name roadtrip
+```
 
 ## 3. Build
 
@@ -40,8 +68,8 @@ sam deploy \
   --resolve-s3 \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
-     CloudFrontPublicKey="$(cat public_key.pem)" \
-     PrivateKeyPem="$(cat private_key.pem)"
+     CloudFrontPublicKey=/roadtrip/cf-public-key \
+     PrivateKeySecretArn="$SECRET_ARN"
 ```
 
 This takes ~5–15 min the first time (CloudFront distributions are slow to
@@ -69,8 +97,8 @@ sam deploy \
   --resolve-s3 \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
-     CloudFrontPublicKey="$(cat public_key.pem)" \
-     PrivateKeyPem="$(cat private_key.pem)" \
+     CloudFrontPublicKey=/roadtrip/cf-public-key \
+     PrivateKeySecretArn="$SECRET_ARN" \
      CFDomain="$CF"
 ```
 
