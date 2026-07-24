@@ -1,0 +1,9 @@
+{
+  "name": "roadtrip-map",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Local-first PWA: your photos on a map, connected into shareable trips.",
+  "dependencies": {
+    "@netlify/blobs": "^10.7.9"
+  }
+}
