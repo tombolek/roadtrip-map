@@ -4,7 +4,7 @@
    2. Caches the app shell + CDN libs for offline use. */
 "use strict";
 
-const CACHE = "roadtrip-v5";
+const CACHE = "roadtrip-v6";
 const SHELL = [
   "/", "/index.html", "/app.js", "/manifest.webmanifest",
   "/icons/icon-192.png", "/icons/icon-512.png",
@@ -94,6 +94,7 @@ self.addEventListener("fetch", e => {
 
   if (e.request.method !== "GET") return;          // let API calls pass through
   if (url.pathname.startsWith("/api/")) return;    // never cache trip data
+  if (url.pathname.startsWith("/trips/")) return;  // CDN + browser cache these images
   if (url.pathname.startsWith("/tile") || url.hostname.includes("openstreetmap")) return; // live map tiles
 
   // CDN libs: cache-first

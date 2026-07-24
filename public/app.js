@@ -1,5 +1,6 @@
 /* Roadtrip Map — app logic. Local-first: everything lives in IndexedDB on this
-   device. Publishing a trip uploads a copy to Netlify Blobs via /api/trips. */
+   device. Publishing uploads a copy to S3 (presigned direct upload); viewers
+   authenticate once (/api/auth) and load images straight from CloudFront. */
 "use strict";
 
 /* ---------------- IndexedDB ---------------- */
@@ -117,6 +118,8 @@ const objUrls = new Map(); // photoId -> object URL (thumbs)
 let viewerMode = null; // { id, pass, name } when viewing a shared trip
 
 function thumbUrl(p) {
+  // viewer mode: thumbnails come straight from CloudFront (signed cookie set)
+  if (p.thumbSrc) return p.thumbSrc;
   if (objUrls.has(p.id)) return objUrls.get(p.id);
   const b = p.thumb || p.blob;
   if (!b) return "";
@@ -318,22 +321,18 @@ async function drainInbox() {
 /* ---------------- fullscreen photo ---------------- */
 let photoViewCurrent = null, photoViewUrl = null;
 async function openPhotoView(p) {
-  // in viewer mode the full-size photo is fetched lazily, on first open
-  if (viewerMode && !p.blob) {
-    busy("Loading photo…");
-    try {
-      const r = await fetch(`/api/trips/${viewerMode.id}/photos/${p.id}`, {
-        headers: { "x-trip-key": viewerMode.pass },
-      });
-      if (r.ok) p.blob = await r.blob();
-    } catch (e) { console.warn(e); }
-    busy(false);
-  }
-  if (!p.blob && !p.thumb) { toast("Could not load this photo"); return; }
+  let src;
+  if (p.fullSrc) {
+    // viewer mode: full image served by CloudFront (signed cookie already set)
+    src = p.fullSrc;
+    if (photoViewUrl) { URL.revokeObjectURL(photoViewUrl); photoViewUrl = null; }
+  } else if (p.blob || p.thumb) {
+    if (photoViewUrl) URL.revokeObjectURL(photoViewUrl);
+    photoViewUrl = URL.createObjectURL(p.blob || p.thumb);
+    src = photoViewUrl;
+  } else { toast("Could not load this photo"); return; }
   photoViewCurrent = p;
-  if (photoViewUrl) URL.revokeObjectURL(photoViewUrl);
-  photoViewUrl = URL.createObjectURL(p.blob || p.thumb);
-  $("photoViewImg").src = photoViewUrl;
+  $("photoViewImg").src = src;
   $("photoViewCap").textContent = fmtDate(p.ts) + (p.lat == null ? " · no location" : "");
   $("btnPhotoDelete").style.display = viewerMode ? "none" : "";
   $("photoView").classList.add("open");
@@ -351,7 +350,7 @@ async function publishTrip(pass) {
   if (!list.length) { toast("Add some photos first"); return; }
   try {
     busy("Publishing trip…");
-    const metaRes = await fetch("/api/trips", {
+    const metaRes = await fetch("/api/publish", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -359,17 +358,15 @@ async function publishTrip(pass) {
         password: pass,
         name: trip.name,
         photos: list.map(p => ({ id: p.id, name: p.name, ts: p.ts, lat: p.lat, lng: p.lng })),
+        need: list.map(p => p.id),
       }),
     });
     if (metaRes.status === 401) { busy(false); toast("Wrong password for the already-published trip"); return; }
     if (!metaRes.ok) throw new Error("publish failed: " + metaRes.status);
-    const { id } = await metaRes.json();
-    for (let i = 0; i < list.length; i++) {
-      busy(`Uploading photo ${i + 1} / ${list.length}…`);
-      const p = list[i];
-      if (!(await uploadPhotoPair(id, pass, p))) throw new Error("photo upload failed");
-    }
-    trip.published = { id, password: pass, uploadedIds: list.map(p => p.id), dirty: false, thumbsDone: true };
+    const { id, uploads } = await metaRes.json();
+    const ok = await uploadAllPairs(list, uploads, n => busy(`Uploading photo ${n} / ${list.length}…`));
+    if (!ok) throw new Error("photo upload failed");
+    trip.published = { id, password: pass, uploadedIds: list.map(p => p.id), dirty: false };
     await idb.put("trips", trip);
     busy(false);
     const link = `${location.origin}/#/trip/${id}`;
@@ -382,7 +379,7 @@ async function publishTrip(pass) {
     };
   } catch (e) {
     console.error(e); busy(false);
-    toast("Publishing failed — is the site deployed on Netlify with the function?");
+    toast("Publishing failed — check your connection and try again");
   }
 }
 
@@ -391,19 +388,36 @@ async function publishTrip(pass) {
    are pushed to the shared copy automatically. If offline, the trip is
    marked dirty and synced next time the app is opened/visible. */
 let syncInFlight = false;
-/* uploads thumbnail + full image for one photo; returns false on failure */
-async function uploadPhotoPair(pubId, pass, p) {
-  const headers = { "x-trip-key": pass, "content-type": "image/jpeg" };
+/* PUT a blob straight to S3 using a presigned URL (content-type must match
+   what the Lambda signed the URL with — image/jpeg) */
+async function putPresigned(url, blob) {
   try {
-    if (p.thumb) {
-      const tr = await fetch(`/api/trips/${pubId}/thumbs/${p.id}`, { method: "PUT", headers, body: p.thumb });
-      if (!tr.ok) return false;
-    }
-    const b = p.blob || p.thumb;
-    if (!b) return true; // nothing decodable to upload; meta only
-    const r = await fetch(`/api/trips/${pubId}/photos/${p.id}`, { method: "PUT", headers, body: b });
+    const r = await fetch(url, { method: "PUT", headers: { "content-type": "image/jpeg" }, body: blob });
     return r.ok;
   } catch { return false; }
+}
+/* uploads thumbnail + full image for one photo via its presigned URL pair */
+async function uploadPair(entry, p) {
+  if (!entry) return true;
+  if (p.thumb && entry.thumb && !(await putPresigned(entry.thumb, p.thumb))) return false;
+  const full = p.blob || p.thumb;
+  if (full && entry.photo && !(await putPresigned(entry.photo, full))) return false;
+  return true;
+}
+/* upload many photos in parallel (bounded concurrency) with progress */
+async function uploadAllPairs(list, uploads, onProgress) {
+  const CONC = 5;
+  const queue = list.filter(p => uploads[p.id]);
+  let done = 0, ok = true, i = 0;
+  async function worker() {
+    while (i < queue.length) {
+      const p = queue[i++];
+      if (!(await uploadPair(uploads[p.id], p))) ok = false;
+      onProgress && onProgress(++done);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(CONC, queue.length) }, worker));
+  return ok;
 }
 async function markDirtyAndSync(tripId) {
   const trip = trips.find(t => t.id === tripId);
@@ -418,7 +432,9 @@ async function syncPublishedTrip(trip) {
   const pub = trip.published;
   try {
     const list = sortPhotos(await idb.byIndex("photos", "tripId", trip.id));
-    const r = await fetch("/api/trips", {
+    const uploaded = new Set(pub.uploadedIds || []);
+    const need = list.filter(p => !uploaded.has(p.id)).map(p => p.id);
+    const r = await fetch("/api/publish", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -426,29 +442,15 @@ async function syncPublishedTrip(trip) {
         password: pub.password,
         name: trip.name,
         photos: list.map(p => ({ id: p.id, name: p.name, ts: p.ts, lat: p.lat, lng: p.lng })),
+        need,
       }),
     });
+    if (r.status === 401) { syncInFlight = false; return; } // password changed; leave dirty, don't spam
     if (!r.ok) throw new Error("meta sync failed " + r.status);
-    const uploaded = new Set(pub.uploadedIds || []);
-    for (const p of list) {
-      if (uploaded.has(p.id)) continue;
-      if (!(await uploadPhotoPair(pub.id, pub.password, p))) throw new Error("photo sync failed");
-      uploaded.add(p.id);
-      pub.uploadedIds = [...uploaded];
-      await idb.put("trips", trip);
-    }
-    // one-time backfill of thumbnails for trips published before thumbs existed
-    if (!pub.thumbsDone) {
-      for (const p of list) {
-        if (!p.thumb) continue;
-        await fetch(`/api/trips/${pub.id}/thumbs/${p.id}`, {
-          method: "PUT", headers: { "x-trip-key": pub.password, "content-type": "image/jpeg" }, body: p.thumb,
-        });
-      }
-      pub.thumbsDone = true;
-      await idb.put("trips", trip);
-    }
-    pub.uploadedIds = pub.uploadedIds ? pub.uploadedIds.filter(id => list.some(p => p.id === id)) : [];
+    const { uploads } = await r.json();
+    const ok = await uploadAllPairs(list.filter(p => need.includes(p.id)), uploads);
+    if (!ok) throw new Error("photo sync failed");
+    pub.uploadedIds = list.map(p => p.id);   // meta already dropped removed photos server-side
     pub.dirty = false;
     await idb.put("trips", trip);
     toast("Shared link updated");
@@ -461,9 +463,7 @@ async function syncPublishedTrip(trip) {
   }
 }
 async function syncAllDirty() {
-  for (const t of trips) {
-    if (t.published && (t.published.dirty || !t.published.thumbsDone)) await syncPublishedTrip(t);
-  }
+  for (const t of trips) if (t.published?.dirty) await syncPublishedTrip(t);
 }
 
 /* ---------------- shared-trip viewer mode ---------------- */
@@ -507,7 +507,14 @@ async function startViewer(tripId) {
     if (!pass) return;
     busy("Loading trip…");
     try {
-      const r = await fetch(`/api/trips/${tripId}`, { headers: { "x-trip-key": pass } });
+      // one password check → server sets 48h CloudFront signed cookies, so the
+      // browser can then load every image straight from the CDN with <img src>
+      const r = await fetch("/api/auth", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ tripId, password: pass }),
+      });
       if (r.status === 401) {
         busy(false); localStorage.removeItem(PASS_KEY);
         toast("Wrong password"); dlg.showModal(); return;
@@ -518,23 +525,13 @@ async function startViewer(tripId) {
       viewerMode = { id: tripId, pass, name: data.name };
       $("viewerTitle").textContent = data.name;
       document.title = data.name + " — Roadtrip Map";
-      // fetch only small thumbnails up front (auth header ⇒ can't use plain
-      // <img src>); the full-size photo is downloaded on demand when opened
-      const ps = [];
-      const metas = sortPhotos(data.photos || []);
-      for (let i = 0; i < metas.length; i++) {
-        busy(`Loading thumbnails ${i + 1} / ${metas.length}…`);
-        const pm = metas[i];
-        let thumb = null;
-        try {
-          let pr = await fetch(`/api/trips/${tripId}/thumbs/${pm.id}`, { headers: { "x-trip-key": pass } });
-          if (pr.status === 404) // trip published before thumbnails existed
-            pr = await fetch(`/api/trips/${tripId}/photos/${pm.id}`, { headers: { "x-trip-key": pass } });
-          if (pr.ok) thumb = await pr.blob();
-        } catch (e) { console.warn(e); }
-        ps.push({ ...pm, thumb, blob: null, tripId });
-      }
-      photos = sortPhotos(ps);
+      // no per-image fetching: thumbnails + full photos are plain CDN URLs, the
+      // browser lazy-loads and caches them, cookies authorize each request
+      photos = sortPhotos((data.photos || []).map(pm => ({
+        ...pm, tripId,
+        thumbSrc: `/trips/${tripId}/thumbs/${pm.id}`,
+        fullSrc: `/trips/${tripId}/photos/${pm.id}`,
+      })));
       busy(false);
       renderAll();
       if (!photos.length) toast("This trip has no photos yet");
