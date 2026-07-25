@@ -39,10 +39,19 @@ function hashPassword(password, saltHex) {
   const hash = crypto.pbkdf2Sync(password, salt, 100000, 32, "sha256");
   return { salt: salt.toString("hex"), hash: hash.toString("hex") };
 }
-function verify(password, rec) {
-  const { hash } = hashPassword(password, rec.salt);
-  const a = Buffer.from(hash, "hex"), b = Buffer.from(rec.hash, "hex");
+function hashMatches(password, saltHex, hashHex) {
+  if (!saltHex || !hashHex) return false;
+  const { hash } = hashPassword(password || "", saltHex);
+  const a = Buffer.from(hash, "hex"), b = Buffer.from(hashHex, "hex");
   return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+// view password: rec.salt/rec.hash
+function verifyView(password, rec) { return hashMatches(password, rec.salt, rec.hash); }
+// editor code: rec.esalt/rec.ehash; legacy trips (no editor hash) fall back to
+// the single original password so existing trips keep working until re-shared
+function verifyEdit(code, rec) {
+  if (rec.ehash) return hashMatches(code, rec.esalt, rec.ehash);
+  return hashMatches(code, rec.salt, rec.hash);
 }
 
 const json = (statusCode, obj, extra = {}) => ({
@@ -81,7 +90,10 @@ export const handler = async (event) => {
     /* ---------- POST /api/publish ---------- */
     if (method === "POST" && path.endsWith("/publish")) {
       const { tripId, password, name, photos, need, dayNotes, track } = body;
-      if (!password || String(password).length < 4) return json(400, { error: "password too short" });
+      // dual secrets; legacy clients may still send a single `password`
+      const viewPassword = body.viewPassword || password;
+      const editKey = body.editKey || password;
+      if (!editKey || String(editKey).length < 4) return json(400, { error: "editor code too short" });
       if (!name || !Array.isArray(photos)) return json(400, { error: "missing name/photos" });
       if (photos.length > 2000) return json(400, { error: "too many photos" });
 
@@ -113,21 +125,28 @@ export const handler = async (event) => {
         }
       }
 
-      let id, salt, hash;
+      let id, salt, hash, esalt, ehash;
       if (tripId) {
         const rec = await getTrip(cleanId(tripId));
         if (!rec) return json(404, { error: "not found" });
-        if (!verify(password, rec)) return json(401, { error: "unauthorized" });
-        id = cleanId(tripId); salt = rec.salt; hash = rec.hash;
+        if (!verifyEdit(editKey, rec)) return json(401, { error: "unauthorized" });
+        id = cleanId(tripId);
+        // keep existing view hash unless a viewPassword is explicitly provided
+        salt = rec.salt; hash = rec.hash;
+        if (body.viewPassword) ({ salt, hash } = hashPassword(body.viewPassword));
+        // upgrade legacy trips (no editor hash) to a distinct editor code
+        esalt = rec.esalt; ehash = rec.ehash;
+        if (!ehash || body.editKey) ({ salt: esalt, hash: ehash } = hashPassword(editKey));
         await deleteOrphans(id, new Set(clean.map(p => p.id)));
       } else {
         id = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
-        ({ salt, hash } = hashPassword(password));
+        ({ salt, hash } = hashPassword(viewPassword));
+        ({ salt: esalt, hash: ehash } = hashPassword(editKey));
       }
 
       await ddb.send(new PutCommand({
         TableName: TABLE,
-        Item: { tripId: id, name: String(name).slice(0, 80), photos: clean, dayNotes: cleanNotes, track: cleanTrack, salt, hash, updatedAt: Date.now() },
+        Item: { tripId: id, name: String(name).slice(0, 80), photos: clean, dayNotes: cleanNotes, track: cleanTrack, salt, hash, esalt, ehash, updatedAt: Date.now() },
       }));
 
       // presigned direct-to-S3 upload URLs (only for the ids the client still needs)
@@ -151,7 +170,13 @@ export const handler = async (event) => {
       const id = cleanId(tripId || "");
       const rec = await getTrip(id);
       if (!rec) return json(404, { error: "not found" });
-      if (!verify(password || "", rec)) return json(401, { error: "unauthorized" });
+      // a viewer password grants read; the editor code grants edit (and read).
+      // check editor first so a distinct editor code isn't shadowed.
+      let role = null;
+      if (verifyEdit(password || "", rec) && rec.ehash) role = "editor";
+      else if (verifyView(password || "", rec)) role = "viewer";
+      else if (verifyEdit(password || "", rec)) role = "editor"; // legacy (no ehash)
+      if (!role) return json(401, { error: "unauthorized" });
 
       const exp = Math.floor(Date.now() / 1000) + COOKIE_TTL;
       const policy = JSON.stringify({
@@ -167,7 +192,7 @@ export const handler = async (event) => {
         `CloudFront-Signature=${signed["CloudFront-Signature"]}; ${attrs}`,
         `CloudFront-Key-Pair-Id=${signed["CloudFront-Key-Pair-Id"]}; ${attrs}`,
       ];
-      return json(200, { id, name: rec.name, photos: rec.photos, dayNotes: rec.dayNotes || {}, track: rec.track || [] }, { cookies });
+      return json(200, { id, role, name: rec.name, photos: rec.photos, dayNotes: rec.dayNotes || {}, track: rec.track || [] }, { cookies });
     }
 
     /* ---------- POST /api/unpublish — remove a shared trip entirely ---------- */
@@ -176,7 +201,7 @@ export const handler = async (event) => {
       const id = cleanId(tripId || "");
       const rec = await getTrip(id);
       if (!rec) return json(200, { ok: true });          // already gone — idempotent
-      if (!verify(password || "", rec)) return json(401, { error: "unauthorized" });
+      if (!verifyEdit(password || "", rec)) return json(401, { error: "unauthorized" });
       // delete all image objects, then the DynamoDB record
       let token;
       do {
