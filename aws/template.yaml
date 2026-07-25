@@ -88,6 +88,16 @@ Resources:
         - AttributeName: username
           KeyType: HASH
 
+  # Reverse-geocoding for day place-names (town). HERE allows storing results,
+  # which we do (we cache the town string per day in DynamoDB).
+  PlaceIndex:
+    Type: AWS::Location::PlaceIndex
+    Properties:
+      IndexName: !Sub "${AWS::StackName}-places"
+      DataSource: Here
+      DataSourceConfiguration:
+        IntendedUse: Storage
+
   # HMAC key for signing owner session tokens (auto-generated, never leaves AWS)
   SessionSecret:
     Type: AWS::SecretsManager::Secret
@@ -111,6 +121,7 @@ Resources:
           CF_KEY_PAIR_ID: !Ref SigningPublicKey
           PRIVATE_KEY_SECRET_ARN: !Ref PrivateKeySecretArn
           SESSION_SECRET_ARN: !Ref SessionSecret
+          PLACE_INDEX: !Ref PlaceIndex
       FunctionUrlConfig:
         AuthType: NONE
         Cors:
@@ -130,6 +141,10 @@ Resources:
               Resource:
                 - !Ref PrivateKeySecretArn
                 - !Ref SessionSecret
+        - Statement:
+            - Effect: Allow
+              Action: geo:SearchPlaceIndexForPosition
+              Resource: !GetAtt PlaceIndex.Arn
 
   # ---------------- CloudFront ----------------
   Oac:
