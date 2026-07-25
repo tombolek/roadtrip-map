@@ -13,11 +13,13 @@ import { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand 
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { getSignedCookies } from "@aws-sdk/cloudfront-signer";
 import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
+import { LocationClient, SearchPlaceIndexForPositionCommand } from "@aws-sdk/client-location";
 import crypto from "node:crypto";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const s3 = new S3Client({});
 const sm = new SecretsManagerClient({});
+const loc = new LocationClient({});
 
 const TABLE = process.env.TABLE;
 const ACCOUNTS_TABLE = process.env.ACCOUNTS_TABLE;
@@ -26,6 +28,7 @@ const CF_DOMAIN = process.env.CF_DOMAIN;            // e.g. d123.cloudfront.net
 const KEY_PAIR_ID = process.env.CF_KEY_PAIR_ID;     // CloudFront public key id
 const SECRET_ARN = process.env.PRIVATE_KEY_SECRET_ARN;
 const SESSION_SECRET_ARN = process.env.SESSION_SECRET_ARN;
+const PLACE_INDEX = process.env.PLACE_INDEX;
 const COOKIE_TTL = 48 * 60 * 60;                    // seconds (media cookies)
 const SESSION_TTL = 30 * 24 * 60 * 60;              // seconds (owner login)
 const UPLOAD_TTL = 60 * 60;
@@ -108,6 +111,37 @@ async function deleteOrphans(id, keepIds) {
       token = out.IsTruncated ? out.NextContinuationToken : undefined;
     } while (token);
   }
+}
+
+/* reverse-geocode a [lat,lng] to a town name (best effort; never throws) */
+async function reverseTown(lat, lng) {
+  try {
+    const r = await loc.send(new SearchPlaceIndexForPositionCommand({
+      IndexName: PLACE_INDEX, Position: [lng, lat], MaxResults: 1, Language: "en",
+    }));
+    const p = r.Results && r.Results[0] && r.Results[0].Place;
+    if (!p) return "";
+    return String(p.Municipality || p.SubRegion || p.Region || p.Country || "").slice(0, 80);
+  } catch (e) { console.warn("geocode failed", lat, lng, e.message); return ""; }
+}
+/* day -> town map, reusing cached results when a day's representative point
+   hasn't moved (so we only pay for newly added / changed days) */
+async function buildDayPlaces(dayPoints, prevPlaces, prevPoints) {
+  const places = {}, points = {};
+  if (!dayPoints || typeof dayPoints !== "object") return { places: prevPlaces || {}, points: prevPoints || {} };
+  const near = (a, b) => Array.isArray(a) && Array.isArray(b) && Math.abs(a[0] - b[0]) < 1e-4 && Math.abs(a[1] - b[1]) < 1e-4;
+  for (const [k, pt] of Object.entries(dayPoints).slice(0, 400)) {
+    const key = String(k).slice(0, 20);
+    if (!Array.isArray(pt) || !Number.isFinite(pt[0]) || !Number.isFinite(pt[1])) continue;
+    const coord = [Math.round(pt[0] * 1e5) / 1e5, Math.round(pt[1] * 1e5) / 1e5];
+    if (prevPlaces && prevPlaces[key] && near(prevPoints && prevPoints[key], coord)) {
+      places[key] = prevPlaces[key]; points[key] = prevPoints[key];        // cache hit — no geocode
+    } else {
+      const town = await reverseTown(coord[0], coord[1]);
+      if (town) { places[key] = town; points[key] = coord; }
+    }
+  }
+  return { places, points };
 }
 
 export const handler = async (event) => {
@@ -258,9 +292,16 @@ export const handler = async (event) => {
         if (editKey && !session) ({ salt: esalt, hash: ehash } = hashPassword(editKey));
       }
 
+      // day place-names: only geocode when enabled; reuse cached towns otherwise
+      const showPlaces = typeof body.showPlaces === "boolean" ? body.showPlaces : (rec?.showPlaces !== false);
+      const dp = showPlaces
+        ? await buildDayPlaces(body.dayPoints, rec?.dayPlaces, rec?.dayPlacePoints)
+        : { places: rec?.dayPlaces || {}, points: rec?.dayPlacePoints || {} };
+
       const item = {
         tripId: id, name: String(name).slice(0, 80),
         photos: clean, dayNotes: cleanNotes, track: cleanTrack,
+        dayPlaces: dp.places, dayPlacePoints: dp.points, showPlaces,
         disabled: typeof body.disabled === "boolean" ? body.disabled : (rec?.disabled || false),
         viewCount: rec?.viewCount || 0, uniqueCount: rec?.uniqueCount || 0, lastAccess: rec?.lastAccess || null,
         dailyViews: rec?.dailyViews || {},
@@ -283,7 +324,7 @@ export const handler = async (event) => {
             Bucket: BUCKET, Key: `trips/${id}/thumbs/${p.id}`, ContentType: "image/jpeg" }), { expiresIn: UPLOAD_TTL }),
         };
       }
-      return json(200, { id, uploads });
+      return json(200, { id, uploads, dayPlaces: item.dayPlaces, showPlaces: item.showPlaces });
     }
 
     /* ---------- POST /api/auth ---------- */
@@ -341,7 +382,7 @@ export const handler = async (event) => {
         `CloudFront-Key-Pair-Id=${signed["CloudFront-Key-Pair-Id"]}; ${attrs}`,
         ...extraCookies,
       ];
-      return json(200, { id, role, name: rec.name, photos: rec.photos, dayNotes: rec.dayNotes || {}, track: rec.track || [] }, { cookies });
+      return json(200, { id, role, name: rec.name, photos: rec.photos, dayNotes: rec.dayNotes || {}, track: rec.track || [], dayPlaces: rec.dayPlaces || {}, showPlaces: rec.showPlaces !== false }, { cookies });
     }
 
     /* ---------- POST /api/set-disabled — activate/deactivate a share link (owner) ---------- */
