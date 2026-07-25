@@ -210,6 +210,8 @@ export const handler = async (event) => {
       const editKey = body.editKey || password;
       if (!name || !Array.isArray(photos)) return json(400, { error: "missing name/photos" });
       if (photos.length > 2000) return json(400, { error: "too many photos" });
+      // an update must carry a valid tripId; a create must omit it entirely
+      if (tripId != null && tripId !== "" && !cleanId(tripId)) return json(400, { error: "invalid tripId" });
       if (!session && (!editKey || String(editKey).length < 4)) return json(401, { error: "not authorized" });
 
       // route track: array of [lat,lng] finite pairs, capped
@@ -288,6 +290,7 @@ export const handler = async (event) => {
     if (method === "POST" && path.endsWith("/auth")) {
       const { tripId, password } = body;
       const id = cleanId(tripId || "");
+      if (!id) return json(400, { error: "missing tripId" });
       const rec = await getTrip(id);
       if (!rec) return json(404, { error: "not found" });
       const owner = await readSession(event);   // logged-in owner may preview any trip
@@ -346,6 +349,7 @@ export const handler = async (event) => {
       const owner = await readSession(event);
       if (!owner) return json(401, { error: "not logged in" });
       const id = cleanId(body.tripId || "");
+      if (!id) return json(400, { error: "missing tripId" });
       const rec = await getTrip(id);
       if (!rec) return json(404, { error: "not found" });
       await ddb.send(new UpdateCommand({
@@ -360,6 +364,7 @@ export const handler = async (event) => {
     if (method === "POST" && path.endsWith("/unpublish")) {
       const { tripId, password } = body;
       const id = cleanId(tripId || "");
+      if (!id) return json(400, { error: "missing tripId" });
       const rec = await getTrip(id);
       if (!rec) return json(200, { ok: true });          // already gone — idempotent
       const owner = await readSession(event);
