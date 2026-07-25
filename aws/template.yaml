@@ -77,6 +77,25 @@ Resources:
         - AttributeName: tripId
           KeyType: HASH
 
+  AccountsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: username
+          AttributeType: S
+      KeySchema:
+        - AttributeName: username
+          KeyType: HASH
+
+  # HMAC key for signing owner session tokens (auto-generated, never leaves AWS)
+  SessionSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
   # ---------------- API Lambda ----------------
   ApiFunction:
     Type: AWS::Serverless::Function
@@ -86,10 +105,12 @@ Resources:
       Environment:
         Variables:
           TABLE: !Ref TripsTable
+          ACCOUNTS_TABLE: !Ref AccountsTable
           MEDIA_BUCKET: !Ref MediaBucket
           CF_DOMAIN: !Ref CFDomain
           CF_KEY_PAIR_ID: !Ref SigningPublicKey
           PRIVATE_KEY_SECRET_ARN: !Ref PrivateKeySecretArn
+          SESSION_SECRET_ARN: !Ref SessionSecret
       FunctionUrlConfig:
         AuthType: NONE
         Cors:
@@ -99,12 +120,16 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref TripsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AccountsTable
         - S3CrudPolicy:
             BucketName: !Ref MediaBucket
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
-              Resource: !Ref PrivateKeySecretArn
+              Resource:
+                - !Ref PrivateKeySecretArn
+                - !Ref SessionSecret
 
   # ---------------- CloudFront ----------------
   Oac:
