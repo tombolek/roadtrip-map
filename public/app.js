@@ -482,6 +482,7 @@ function renderTripSelect() {
 async function switchTrip(id) {
   currentTripId = id; await kvSet("currentTripId", id);
   selectMode = false; selectedIds.clear();
+  await ensureEditorCookies(trips.find(t => t.id === id));
   await loadPhotos(); renderTripSelect(); renderAll();
 }
 async function loadPhotos() {
@@ -689,7 +690,7 @@ function initPhotoViewControls() {
 }
 
 /* ---------------- publish / share ---------------- */
-async function publishTrip(pass) {
+async function publishTrip(viewPassword, editKey) {
   const trip = trips.find(t => t.id === currentTripId);
   if (!trip) return;
   const list = photos;
@@ -701,7 +702,7 @@ async function publishTrip(pass) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         tripId: trip.published?.id || null,
-        password: pass,
+        viewPassword, editKey,
         name: trip.name,
         photos: list.map(p => ({ id: p.id, name: p.name, ts: p.ts, lat: p.lat, lng: p.lng, caption: p.caption || "" })),
         dayNotes: trip.dayNotes || {},
@@ -709,21 +710,24 @@ async function publishTrip(pass) {
         need: list.map(p => p.id),
       }),
     });
-    if (metaRes.status === 401) { busy(false); toast("Wrong password for the already-published trip"); return; }
+    if (metaRes.status === 401) { busy(false); toast("Editor code didn't match the published trip"); return; }
     if (!metaRes.ok) throw new Error("publish failed: " + metaRes.status);
     const { id, uploads } = await metaRes.json();
     const ok = await uploadAllPairs(list, uploads, n => busy(`Uploading photo ${n} / ${list.length}…`));
     if (!ok) throw new Error("photo upload failed");
-    trip.published = { id, password: pass, uploadedIds: list.map(p => p.id), dirty: false };
+    trip.published = { id, editKey, viewPassword, uploadedIds: list.map(p => p.id), dirty: false };
     await idb.put("trips", trip);
     busy(false);
-    const link = `${location.origin}/#/trip/${id}`;
+    const viewLink = `${location.origin}/#/trip/${id}`;
+    const editLink = `${location.origin}/#/edit/${id}`;
     $("shareForm").style.display = "none";
     $("shareResult").style.display = "block";
-    $("shareLink").textContent = link;
+    $("shareLink").textContent = `${viewLink}   ·   password: ${viewPassword}`;
+    $("shareEditLink").textContent = `${editLink}   ·   editor code: ${editKey}`;
     $("btnCopyLink").onclick = async () => {
-      try { await navigator.clipboard.writeText(link); toast("Link copied"); } catch { }
-      if (navigator.share) navigator.share({ title: trip.name, text: `Our trip “${trip.name}” — password: ask me 😉`, url: link }).catch(() => { });
+      const msg = `${viewLink}\nPassword: ${viewPassword}`;
+      try { await navigator.clipboard.writeText(msg); toast("View link copied"); } catch { }
+      if (navigator.share) navigator.share({ title: trip.name, text: `Our trip “${trip.name}”`, url: viewLink }).catch(() => { });
     };
   } catch (e) {
     console.error(e); busy(false);
@@ -787,7 +791,7 @@ async function syncPublishedTrip(trip) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         tripId: pub.id,
-        password: pub.password,
+        editKey: pub.editKey || pub.password,   // legacy trips fall back to old password
         name: trip.name,
         photos: list.map(p => ({ id: p.id, name: p.name, ts: p.ts, lat: p.lat, lng: p.lng, caption: p.caption || "" })),
         dayNotes: trip.dayNotes || {},
@@ -795,7 +799,7 @@ async function syncPublishedTrip(trip) {
         need,
       }),
     });
-    if (r.status === 401) { syncInFlight = false; return; } // password changed; leave dirty, don't spam
+    if (r.status === 401) { syncInFlight = false; return; } // editor code changed; leave dirty, don't spam
     if (!r.ok) throw new Error("meta sync failed " + r.status);
     const { uploads } = await r.json();
     const ok = await uploadAllPairs(list.filter(p => need.includes(p.id)), uploads);
@@ -814,6 +818,88 @@ async function syncPublishedTrip(trip) {
 }
 async function syncAllDirty() {
   for (const t of trips) if (t.published?.dirty) await syncPublishedTrip(t);
+}
+
+/* ---------------- editor mode (open a shared trip to edit) ---------------- */
+function parseEditHash() {
+  const m = location.hash.match(/^#\/edit\/([A-Za-z0-9_-]+)$/);
+  return m ? m[1] : null;
+}
+const authedTrips = new Set();
+// refresh the 48h view cookies for an adopted trip so its remote images load
+async function ensureEditorCookies(trip) {
+  if (!trip?.published?.editKey || authedTrips.has(trip.published.id)) return;
+  const ps = await idb.byIndex("photos", "tripId", trip.id);
+  if (!ps.some(p => p.remote)) return; // no remote images → no cookies needed
+  try {
+    const r = await fetch("/api/auth", {
+      method: "POST", headers: { "content-type": "application/json" }, credentials: "include",
+      body: JSON.stringify({ tripId: trip.published.id, password: trip.published.editKey }),
+    });
+    if (r.ok) authedTrips.add(trip.published.id);
+  } catch { }
+}
+// merge a shared trip into local storage as an editable trip
+async function adoptTripLocally(id, code, data) {
+  let local = trips.find(t => t.published?.id === id);
+  if (!local) {
+    local = { id: uid(), name: data.name || "Shared trip", createdAt: Date.now(),
+      published: { id, editKey: code, viewPassword: "", uploadedIds: [], dirty: false }, dayNotes: {}, track: [] };
+  }
+  local.name = data.name || local.name;
+  local.published.editKey = code;
+  local.dayNotes = data.dayNotes || {};
+  local.track = data.track || [];
+  await idb.put("trips", local);
+  const serverIds = new Set((data.photos || []).map(p => p.id));
+  const localPhotos = await idb.byIndex("photos", "tripId", local.id);
+  const localById = new Map(localPhotos.map(p => [p.id, p]));
+  for (const lp of localPhotos) if (lp.remote && !serverIds.has(lp.id)) await idb.del("photos", lp.id);
+  for (const pm of (data.photos || [])) {
+    const ex = localById.get(pm.id);
+    if (ex && !ex.remote) continue; // her own uploaded photo — keep the local blob
+    await idb.put("photos", {
+      id: pm.id, tripId: local.id, name: pm.name, ts: pm.ts, lat: pm.lat, lng: pm.lng, caption: pm.caption || "",
+      thumbSrc: `/trips/${id}/thumbs/${pm.id}`, fullSrc: `/trips/${id}/photos/${pm.id}`, remote: true,
+    });
+  }
+  local.published.uploadedIds = [...serverIds];
+  await idb.put("trips", local);
+  if (!trips.find(t => t.id === local.id)) trips.unshift(local);
+  authedTrips.add(id);
+  await switchTrip(local.id);
+}
+async function adoptEditorTrip(id) {
+  const existing = trips.find(t => t.published?.id === id);
+  if (existing?.published?.editKey) {
+    // already adopted — refresh silently using the stored code
+    try {
+      const r = await fetch("/api/auth", { method: "POST", headers: { "content-type": "application/json" },
+        credentials: "include", body: JSON.stringify({ tripId: id, password: existing.published.editKey }) });
+      if (r.ok) { const data = await r.json(); if (data.role === "editor") { await adoptTripLocally(id, existing.published.editKey, data); toast("Opened for editing"); return; } }
+    } catch { }
+  }
+  const dlg = $("dlgPass");
+  $("dlgPassTitle").textContent = "Enter editor code";
+  const p = dlg.querySelector("p"); if (p) p.textContent = "Enter the editor code to add or edit photos in this trip.";
+  $("viewPass").value = "";
+  const go = async () => {
+    const code = $("viewPass").value; if (!code) return;
+    dlg.close(); busy("Opening trip for editing…");
+    try {
+      const r = await fetch("/api/auth", { method: "POST", headers: { "content-type": "application/json" },
+        credentials: "include", body: JSON.stringify({ tripId: id, password: code }) });
+      if (r.status === 401) { busy(false); toast("Wrong code"); return; }
+      if (!r.ok) throw new Error("auth " + r.status);
+      const data = await r.json();
+      if (data.role !== "editor") { busy(false); toast("That's a view password — you need the editor code"); return; }
+      await adoptTripLocally(id, code, data);
+      busy(false); toast("Opened for editing");
+    } catch (e) { console.error(e); busy(false); toast("Couldn't open trip"); }
+  };
+  $("btnPassOk").onclick = go;
+  $("viewPass").onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); go(); } };
+  dlg.showModal();
 }
 
 /* ---------------- shared-trip viewer mode ---------------- */
@@ -915,12 +1001,14 @@ async function main() {
 
   const viewerTripId = parseViewerHash();
   if (viewerTripId) { await startViewer(viewerTripId); return; }
+  const editTripId = parseEditHash();
 
-  // owner mode
+  // owner / editor mode
   if (navigator.storage?.persist) navigator.storage.persist();
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(console.warn);
 
   await loadTrips();
+  await ensureEditorCookies(trips.find(t => t.id === currentTripId));
   await loadPhotos();
   renderAll();
   await drainInbox();
@@ -941,17 +1029,21 @@ async function main() {
   $("btnShare").onclick = () => {
     if (!currentTripId || !photos.length) { toast("Add some photos to a trip first"); return; }
     const trip = trips.find(t => t.id === currentTripId);
+    const pub = trip.published;
     $("shareForm").style.display = "block";
     $("shareResult").style.display = "none";
-    $("sharePass").value = trip.published?.password || "";
+    $("sharePass").value = (pub && (pub.viewPassword || pub.password)) || "";
+    $("shareEdit").value = (pub && (pub.editKey || pub.password)) || "";
     $("dlgShare").showModal();
   };
   $("btnShareCancel").onclick = () => $("dlgShare").close();
   $("btnShareClose").onclick = () => $("dlgShare").close();
   $("btnSharePublish").onclick = () => {
-    const pass = $("sharePass").value;
-    if (pass.length < 4) { toast("Password must be at least 4 characters"); return; }
-    publishTrip(pass);
+    const vp = $("sharePass").value.trim(), ek = $("shareEdit").value.trim();
+    if (vp.length < 4) { toast("View password must be at least 4 characters"); return; }
+    if (ek.length < 4) { toast("Editor code must be at least 4 characters"); return; }
+    if (vp === ek) { toast("Make the editor code different from the view password"); return; }
+    publishTrip(vp, ek);
   };
   $("btnPhotoDelete").onclick = async () => {
     if (!photoViewCurrent || viewerMode) return;
@@ -970,6 +1062,9 @@ async function main() {
   navigator.serviceWorker?.addEventListener("message", ev => {
     if (ev.data === "inbox-updated") drainInbox();
   });
+
+  // opened via an editor link? adopt the shared trip for editing
+  if (editTripId) await adoptEditorTrip(editTripId);
 }
 
 main().catch(e => {

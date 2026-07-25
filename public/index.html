@@ -109,9 +109,10 @@
   .route-actions { display: flex; gap: 8px; flex-wrap: wrap; }
   .route-hint { font-size: 12px; color: var(--muted); margin-top: 8px; line-height: 1.4; }
   #shareResult { display: none; }
-  #shareLink {
+  .fld-label { display: block; font-size: 12px; color: var(--muted); margin: 6px 2px 4px; font-weight: 600; }
+  .share-box {
     font-size: 13px; background: #f1f5f9; padding: 10px; border-radius: 10px;
-    word-break: break-all; margin-bottom: 10px; user-select: all;
+    word-break: break-all; margin-bottom: 12px; user-select: all;
   }
   /* fullscreen photo viewer */
   #photoView {
@@ -308,10 +309,13 @@
 <dialog id="dlgShare">
   <div id="shareForm">
     <h3>Share this trip</h3>
-    <p>Publishes a copy of this trip (photos + route) to your site so family can
-    view it with a link and this password. Photos you add or remove later are
-    synced to the shared link automatically — viewers just reload the page.</p>
-    <input type="password" id="sharePass" placeholder="Choose a password (min 4 chars)" autocomplete="new-password">
+    <p>Two secrets: a <b>view password</b> for family (they can only look), and an
+    <b>editor code</b> for people who can add/edit photos (e.g. your partner).
+    Changes you make later sync automatically.</p>
+    <label class="fld-label" for="sharePass">Family view password</label>
+    <input type="text" id="sharePass" placeholder="e.g. sunset2026" autocomplete="off">
+    <label class="fld-label" for="shareEdit">Editor code (keep private)</label>
+    <input type="text" id="shareEdit" placeholder="e.g. only-us-42" autocomplete="off">
     <div class="dlg-actions">
       <button class="btn btn-ghost" id="btnShareCancel">Cancel</button>
       <button class="btn btn-primary" id="btnSharePublish">Publish</button>
@@ -319,11 +323,13 @@
   </div>
   <div id="shareResult">
     <h3>Trip published</h3>
-    <p>Send this link and the password to your family:</p>
-    <div id="shareLink"></div>
+    <p><b>For family (view only)</b> — send this link + view password:</p>
+    <div id="shareLink" class="share-box"></div>
+    <p><b>For editors</b> — send this link + editor code (only to people you trust to edit):</p>
+    <div id="shareEditLink" class="share-box"></div>
     <div class="dlg-actions">
       <button class="btn btn-ghost" id="btnShareClose">Close</button>
-      <button class="btn btn-primary" id="btnCopyLink">Copy link</button>
+      <button class="btn btn-primary" id="btnCopyLink">Copy view link</button>
     </div>
   </div>
 </dialog>
