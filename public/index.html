@@ -235,6 +235,24 @@
   #gallery.selecting .gal-cell .chk { display: flex; }
   .gal-cell.sel { outline: 3px solid var(--teal); outline-offset: -3px; }
   .gal-cell.sel .chk { background: var(--teal); border-color: var(--teal); }
+  /* who-uploaded badge */
+  .up-badge {
+    position: absolute; bottom: 5px; left: 5px; min-width: 18px; height: 18px; padding: 0 4px;
+    border-radius: 9px; background: var(--teal); color: #fff; font-size: 11px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center; box-shadow: 0 0 0 1.5px #fff;
+  }
+  /* login + account */
+  #loginWho { display: flex; gap: 8px; margin-bottom: 12px; }
+  #loginWho .who {
+    flex: 1; padding: 12px; border: 1.5px solid var(--line); border-radius: 10px; background: #fff;
+    font-size: 15px; font-weight: 600; cursor: pointer; color: var(--text);
+  }
+  #loginWho .who.active { border-color: var(--teal); background: var(--teal); color: #fff; }
+  .dlg-error { color: #dc2626; font-size: 13px; min-height: 16px; margin: 2px 0 4px; }
+  #acctSection { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; border-top: 1px solid var(--line); margin-top: 12px; padding-top: 12px; }
+  #acctLine { flex: 1; font-size: 13px; color: var(--muted); min-width: 120px; }
+  .acct-actions { display: flex; gap: 8px; }
+  .acct-actions .btn { padding: 6px 10px; font-size: 13px; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -295,6 +313,13 @@
     <button class="btn btn-ghost" id="btnTripsClose">Close</button>
     <button class="btn btn-primary" id="btnNewTrip">New trip</button>
   </div>
+  <div id="acctSection">
+    <span id="acctLine"></span>
+    <span class="acct-actions">
+      <button class="btn btn-ghost" id="btnChangePw">Change password</button>
+      <button class="btn btn-ghost" id="btnLogout">Log out</button>
+    </span>
+  </div>
 </dialog>
 
 <dialog id="dlgName">
@@ -309,28 +334,48 @@
 <dialog id="dlgShare">
   <div id="shareForm">
     <h3>Share this trip</h3>
-    <p>Two secrets: a <b>view password</b> for family (they can only look), and an
-    <b>editor code</b> for people who can add/edit photos (e.g. your partner).
-    Changes you make later sync automatically.</p>
+    <p>Set a <b>view password</b> for family. They can look but not change anything.
+    You and Lucie edit by signing in — no code needed.</p>
     <label class="fld-label" for="sharePass">Family view password</label>
     <input type="text" id="sharePass" placeholder="e.g. sunset2026" autocomplete="off">
-    <label class="fld-label" for="shareEdit">Editor code (keep private)</label>
-    <input type="text" id="shareEdit" placeholder="e.g. only-us-42" autocomplete="off">
     <div class="dlg-actions">
       <button class="btn btn-ghost" id="btnShareCancel">Cancel</button>
-      <button class="btn btn-primary" id="btnSharePublish">Publish</button>
+      <button class="btn btn-primary" id="btnSharePublish">Save &amp; get link</button>
     </div>
   </div>
   <div id="shareResult">
-    <h3>Trip published</h3>
-    <p><b>For family (view only)</b> — send this link + view password:</p>
+    <h3>Ready to share</h3>
+    <p>Send this link and the view password to family:</p>
     <div id="shareLink" class="share-box"></div>
-    <p><b>For editors</b> — send this link + editor code (only to people you trust to edit):</p>
-    <div id="shareEditLink" class="share-box"></div>
     <div class="dlg-actions">
       <button class="btn btn-ghost" id="btnShareClose">Close</button>
-      <button class="btn btn-primary" id="btnCopyLink">Copy view link</button>
+      <button class="btn btn-primary" id="btnCopyLink">Copy link</button>
     </div>
+  </div>
+</dialog>
+
+<dialog id="dlgLogin">
+  <h3>Sign in</h3>
+  <div id="loginWho">
+    <button type="button" class="who" data-u="tom">Tom</button>
+    <button type="button" class="who" data-u="lucie">Lucie</button>
+  </div>
+  <input type="password" id="loginPass" placeholder="Password" autocomplete="current-password">
+  <div class="dlg-error" id="loginError"></div>
+  <div class="dlg-actions">
+    <button class="btn btn-primary" id="btnLoginGo">Sign in</button>
+  </div>
+</dialog>
+
+<dialog id="dlgChangePw">
+  <h3>Change password</h3>
+  <input type="password" id="cpwCurrent" placeholder="Current password" autocomplete="current-password">
+  <input type="password" id="cpwNew" placeholder="New password (min 6)" autocomplete="new-password">
+  <input type="password" id="cpwConfirm" placeholder="Confirm new password" autocomplete="new-password">
+  <div class="dlg-error" id="cpwError"></div>
+  <div class="dlg-actions">
+    <button class="btn btn-ghost" id="btnCpwCancel">Cancel</button>
+    <button class="btn btn-primary" id="btnCpwGo">Update</button>
   </div>
 </dialog>
 

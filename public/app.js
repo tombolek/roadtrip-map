@@ -109,7 +109,7 @@ async function processFile(fileBlob, name, tripId) {
   } catch (e) {
     console.warn("Could not decode image (HEIC?)", name, e);
   }
-  const photo = { id: uid(), tripId, name: name || "photo", ts, lat, lng, w, h, blob, thumb };
+  const photo = { id: uid(), tripId, name: name || "photo", ts, lat, lng, w, h, blob, thumb, uploadedBy: account?.initials || "" };
   await idb.put("photos", photo);
   return photo;
 }
@@ -119,6 +119,7 @@ let trips = [], currentTripId = null, photos = [];   // photos = current trip, s
 let map, markerLayer, routeLine, trackLine, markersById = {};
 const objUrls = new Map(); // photoId -> object URL (thumbs)
 let viewerMode = null; // { id, pass, name } when viewing a shared trip
+let account = null;    // { username, initials, name } when logged in as owner
 
 function thumbUrl(p) {
   // viewer mode: thumbnails come straight from CloudFront (signed cookie set)
@@ -379,6 +380,7 @@ function renderCell(p) {
   img.src = thumbUrl(p); img.loading = "lazy"; img.alt = p.name || "photo";
   cell.appendChild(img);
   if (p.caption) { const c = document.createElement("div"); c.className = "cap"; c.textContent = p.caption; cell.appendChild(c); }
+  if (p.uploadedBy) { const bd = document.createElement("div"); bd.className = "up-badge"; bd.textContent = p.uploadedBy; cell.appendChild(bd); }
   const chk = document.createElement("div"); chk.className = "chk"; chk.textContent = selectedIds.has(p.id) ? "✓" : "";
   cell.appendChild(chk);
   cell.onclick = () => {
@@ -460,11 +462,62 @@ function setView(view) {
 }
 
 /* ---------------- trips ---------------- */
+// Cloud-first: the trip list comes from the server. IndexedDB is just a working
+// cache. Trips are keyed locally by their cloud id (local id === cloud id).
 async function loadTrips() {
-  trips = (await idb.all("trips")).sort((a, b) => b.createdAt - a.createdAt);
+  let cloud = [];
+  try {
+    const r = await fetch("/api/trips", { credentials: "same-origin" });
+    if (r.ok) cloud = (await r.json()).trips || [];
+  } catch (e) { console.warn("trip list fetch failed", e); }
+  const cloudIds = new Set(cloud.map(t => t.id));
+  // clean start: drop any local trips (+photos) that aren't cloud-backed
+  for (const lt of await idb.all("trips")) {
+    if (!lt.published?.id || !cloudIds.has(lt.published.id)) {
+      for (const p of await idb.byIndex("photos", "tripId", lt.id)) await idb.del("photos", p.id);
+      await idb.del("trips", lt.id);
+    }
+  }
+  const byId = new Map((await idb.all("trips")).map(t => [t.id, t]));
+  for (const ct of cloud) {
+    const lt = byId.get(ct.id) || { id: ct.id, published: { id: ct.id, uploadedIds: [], dirty: false, loaded: false }, dayNotes: {}, track: [] };
+    lt.name = ct.name; lt.createdAt = ct.updatedAt || lt.createdAt || Date.now();
+    lt.disabled = ct.disabled; lt.viewCount = ct.viewCount; lt.uniqueCount = ct.uniqueCount;
+    lt.lastAccess = ct.lastAccess; lt.photoCount = ct.photoCount;
+    await idb.put("trips", lt);
+  }
+  trips = (await idb.all("trips")).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   currentTripId = await kvGet("currentTripId");
   if (!trips.find(t => t.id === currentTripId)) currentTripId = trips[0]?.id ?? null;
   renderTripSelect();
+}
+// fetch a trip's full metadata (photos, notes, route) from the cloud on open
+async function loadTripFromCloud(trip) {
+  try {
+    const r = await fetch("/api/auth", {
+      method: "POST", headers: { "content-type": "application/json" },
+      credentials: "same-origin", body: JSON.stringify({ tripId: trip.published.id }),
+    });
+    if (!r.ok) return;
+    const data = await r.json();
+    trip.name = data.name; trip.dayNotes = data.dayNotes || {}; trip.track = data.track || [];
+    const serverIds = new Set((data.photos || []).map(p => p.id));
+    const local = await idb.byIndex("photos", "tripId", trip.id);
+    const localById = new Map(local.map(p => [p.id, p]));
+    for (const lp of local) if (lp.remote && !serverIds.has(lp.id)) await idb.del("photos", lp.id);
+    for (const pm of (data.photos || [])) {
+      const ex = localById.get(pm.id);
+      if (ex && !ex.remote) continue; // keep locally-added blobs
+      await idb.put("photos", {
+        id: pm.id, tripId: trip.id, name: pm.name, ts: pm.ts, lat: pm.lat, lng: pm.lng,
+        caption: pm.caption || "", uploadedBy: pm.uploadedBy || "",
+        thumbSrc: `/trips/${trip.published.id}/thumbs/${pm.id}`, fullSrc: `/trips/${trip.published.id}/photos/${pm.id}`, remote: true,
+      });
+    }
+    trip.published.uploadedIds = [...serverIds];
+    trip.published.loaded = true;
+    await idb.put("trips", trip);
+  } catch (e) { console.warn("trip load failed", e); }
 }
 function renderTripSelect() {
   const sel = $("tripSelect"); sel.innerHTML = "";
@@ -482,7 +535,8 @@ function renderTripSelect() {
 async function switchTrip(id) {
   currentTripId = id; await kvSet("currentTripId", id);
   selectMode = false; selectedIds.clear();
-  await ensureEditorCookies(trips.find(t => t.id === id));
+  const trip = trips.find(t => t.id === id);
+  if (trip?.published && !trip.published.loaded) { busy("Loading trip…"); await loadTripFromCloud(trip); busy(false); }
   await loadPhotos(); renderTripSelect(); renderAll();
 }
 async function loadPhotos() {
@@ -491,57 +545,49 @@ async function loadPhotos() {
   photos = currentTripId ? sortPhotos(await idb.byIndex("photos", "tripId", currentTripId)) : [];
 }
 async function createTrip(name) {
-  const t = { id: uid(), name, createdAt: Date.now(), published: null };
-  await idb.put("trips", t); trips.unshift(t);
-  await switchTrip(t.id);
-  return t;
+  busy("Creating trip…");
+  try {
+    const r = await fetch("/api/publish", {
+      method: "POST", headers: { "content-type": "application/json" },
+      credentials: "same-origin", body: JSON.stringify({ name, photos: [] }),
+    });
+    if (!r.ok) throw new Error("create failed " + r.status);
+    const { id } = await r.json();
+    const t = { id, name, createdAt: Date.now(), published: { id, uploadedIds: [], dirty: false, loaded: true }, dayNotes: {}, track: [] };
+    await idb.put("trips", t); trips.unshift(t);
+    busy(false);
+    await switchTrip(id);
+    return t;
+  } catch (e) { console.error(e); busy(false); toast("Couldn't create trip — check your connection"); }
 }
 async function ensureTrip() {
   if (currentTripId) return currentTripId;
   const t = await createTrip("My trip");
-  return t.id;
-}
-async function unpublishTrip(t) {
-  if (!t.published) return;
-  if (!confirm(`Take down the shared link for “${t.name}”? Family will no longer be able to open it.`)) return;
-  busy("Removing shared trip…");
-  try {
-    const r = await fetch("/api/unpublish", {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ tripId: t.published.id, password: t.published.password }),
-    });
-    if (r.status === 401) { busy(false); toast("Password mismatch — couldn't remove"); return; }
-    if (!r.ok) throw new Error("unpublish failed " + r.status);
-    t.published = null;
-    await idb.put("trips", t);
-    busy(false); renderTripSelect(); renderTripList();
-    toast("Shared link removed");
-  } catch (e) { console.error(e); busy(false); toast("Couldn't remove shared trip — try again"); }
+  return t?.id;
 }
 async function deleteTrip(t) {
-  if (!confirm(`Delete trip “${t.name}” and its photos from this device?`)) return;
-  if (t.published && confirm(`Also remove the shared online copy so the link stops working for family?`)) {
-    try {
-      await fetch("/api/unpublish", {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ tripId: t.published.id, password: t.published.password }),
-      });
-    } catch (e) { console.warn("remote unpublish failed", e); }
-  }
-  const ps = await idb.byIndex("photos", "tripId", t.id);
-  for (const p of ps) await idb.del("photos", p.id);
+  if (!confirm(`Delete trip “${t.name}” for everyone? This removes it and its photos permanently.`)) return;
+  busy("Deleting trip…");
+  try {
+    await fetch("/api/unpublish", {
+      method: "POST", headers: { "content-type": "application/json" },
+      credentials: "same-origin", body: JSON.stringify({ tripId: t.published?.id || t.id }),
+    });
+  } catch (e) { console.warn("remote delete failed", e); }
+  for (const p of await idb.byIndex("photos", "tripId", t.id)) await idb.del("photos", p.id);
   await idb.del("trips", t.id);
   trips = trips.filter(x => x.id !== t.id);
   if (currentTripId === t.id) { currentTripId = trips[0]?.id ?? null; await kvSet("currentTripId", currentTripId); }
+  busy(false);
   await loadPhotos(); renderTripSelect(); renderAll(); renderTripList();
+  toast("Trip deleted");
 }
 function renderTripList() {
   const box = $("tripList"); box.innerHTML = "";
   if (!trips.length) box.innerHTML = '<p>No trips yet — create your first one.</p>';
   for (const t of trips) {
     const row = document.createElement("div"); row.className = "trip-row";
-    const nm = document.createElement("span");
-    nm.textContent = t.name + (t.published ? " ↗" : "");
+    const nm = document.createElement("span"); nm.textContent = t.name;
     const open = document.createElement("button"); open.className = "btn btn-primary"; open.textContent = "Open";
     open.onclick = async () => { await switchTrip(t.id); $("dlgTrips").close(); };
     const ren = document.createElement("button"); ren.className = "btn btn-ghost"; ren.textContent = "Rename";
@@ -549,15 +595,9 @@ function renderTripList() {
       t.name = name; await idb.put("trips", t); renderTripSelect(); renderTripList();
       markDirtyAndSync(t.id);
     });
-    row.append(nm, open, ren);
-    if (t.published) {
-      const uns = document.createElement("button"); uns.className = "btn btn-ghost"; uns.textContent = "Unshare";
-      uns.onclick = () => unpublishTrip(t);
-      row.append(uns);
-    }
     const del = document.createElement("button"); del.className = "btn btn-warn"; del.textContent = "✕";
     del.onclick = () => deleteTrip(t);
-    row.append(del); box.appendChild(row);
+    row.append(nm, open, ren, del); box.appendChild(row);
   }
 }
 function promptName(title, initial, cb) {
@@ -628,7 +668,7 @@ function showPhotoAt(i) {
   else if (p.blob || p.thumb) { photoViewUrl = URL.createObjectURL(p.blob || p.thumb); src = photoViewUrl; }
   else { toast("Could not load this photo"); return; }
   $("photoViewImg").src = src;
-  $("photoViewCap").textContent = fmtDate(p.ts) + (hasGeo(p) ? "" : " · no location");
+  $("photoViewCap").textContent = fmtDate(p.ts) + (hasGeo(p) ? "" : " · no location") + (p.uploadedBy ? ` · added by ${p.uploadedBy}` : "");
   const cap = $("pvCaption");
   cap.value = p.caption || "";
   cap.readOnly = !!viewerMode;
@@ -689,49 +729,37 @@ function initPhotoViewControls() {
   cap.addEventListener("blur", saveCaption);
 }
 
-/* ---------------- publish / share ---------------- */
-async function publishTrip(viewPassword, editKey) {
+/* ---------------- share (set the family view password) ---------------- */
+async function publishTrip(viewPassword) {
   const trip = trips.find(t => t.id === currentTripId);
   if (!trip) return;
   const list = photos;
-  if (!list.length) { toast("Add some photos first"); return; }
   try {
-    busy("Publishing trip…");
-    const metaRes = await fetch("/api/publish", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
+    busy("Setting up sharing…");
+    const r = await fetch("/api/publish", {
+      method: "POST", headers: { "content-type": "application/json" }, credentials: "same-origin",
       body: JSON.stringify({
-        tripId: trip.published?.id || null,
-        viewPassword, editKey,
-        name: trip.name,
-        photos: list.map(p => ({ id: p.id, name: p.name, ts: p.ts, lat: p.lat, lng: p.lng, caption: p.caption || "" })),
-        dayNotes: trip.dayNotes || {},
-        track: trip.track || [],
-        need: list.map(p => p.id),
+        tripId: trip.published.id, viewPassword, name: trip.name,
+        photos: list.map(p => ({ id: p.id, name: p.name, ts: p.ts, lat: p.lat, lng: p.lng, caption: p.caption || "", uploadedBy: p.uploadedBy || "" })),
+        dayNotes: trip.dayNotes || {}, track: trip.track || [], need: [],
       }),
     });
-    if (metaRes.status === 401) { busy(false); toast("Editor code didn't match the published trip"); return; }
-    if (!metaRes.ok) throw new Error("publish failed: " + metaRes.status);
-    const { id, uploads } = await metaRes.json();
-    const ok = await uploadAllPairs(list, uploads, n => busy(`Uploading photo ${n} / ${list.length}…`));
-    if (!ok) throw new Error("photo upload failed");
-    trip.published = { id, editKey, viewPassword, uploadedIds: list.map(p => p.id), dirty: false };
+    if (r.status === 401) { busy(false); toast("Please log in again"); return; }
+    if (!r.ok) throw new Error("share failed: " + r.status);
+    trip.viewPassword = viewPassword;
     await idb.put("trips", trip);
     busy(false);
-    const viewLink = `${location.origin}/#/trip/${id}`;
-    const editLink = `${location.origin}/#/edit/${id}`;
+    const viewLink = `${location.origin}/#/trip/${trip.published.id}`;
     $("shareForm").style.display = "none";
     $("shareResult").style.display = "block";
     $("shareLink").textContent = `${viewLink}   ·   password: ${viewPassword}`;
-    $("shareEditLink").textContent = `${editLink}   ·   editor code: ${editKey}`;
     $("btnCopyLink").onclick = async () => {
-      const msg = `${viewLink}\nPassword: ${viewPassword}`;
-      try { await navigator.clipboard.writeText(msg); toast("View link copied"); } catch { }
+      try { await navigator.clipboard.writeText(`${viewLink}\nPassword: ${viewPassword}`); toast("View link copied"); } catch { }
       if (navigator.share) navigator.share({ title: trip.name, text: `Our trip “${trip.name}”`, url: viewLink }).catch(() => { });
     };
   } catch (e) {
     console.error(e); busy(false);
-    toast("Publishing failed — check your connection and try again");
+    toast("Couldn't set up sharing — try again");
   }
 }
 
@@ -789,17 +817,17 @@ async function syncPublishedTrip(trip) {
     const r = await fetch("/api/publish", {
       method: "POST",
       headers: { "content-type": "application/json" },
+      credentials: "same-origin",                 // owner session cookie authorizes the write
       body: JSON.stringify({
         tripId: pub.id,
-        editKey: pub.editKey || pub.password,   // legacy trips fall back to old password
         name: trip.name,
-        photos: list.map(p => ({ id: p.id, name: p.name, ts: p.ts, lat: p.lat, lng: p.lng, caption: p.caption || "" })),
+        photos: list.map(p => ({ id: p.id, name: p.name, ts: p.ts, lat: p.lat, lng: p.lng, caption: p.caption || "", uploadedBy: p.uploadedBy || "" })),
         dayNotes: trip.dayNotes || {},
         track: trip.track || [],
         need,
       }),
     });
-    if (r.status === 401) { syncInFlight = false; return; } // editor code changed; leave dirty, don't spam
+    if (r.status === 401) { syncInFlight = false; return; } // session expired; leave dirty, will retry
     if (!r.ok) throw new Error("meta sync failed " + r.status);
     const { uploads } = await r.json();
     const ok = await uploadAllPairs(list.filter(p => need.includes(p.id)), uploads);
@@ -807,7 +835,7 @@ async function syncPublishedTrip(trip) {
     pub.uploadedIds = list.map(p => p.id);   // meta already dropped removed photos server-side
     pub.dirty = false;
     await idb.put("trips", trip);
-    toast("Shared link updated");
+    toast("Saved");
   } catch (e) {
     console.warn("sync postponed:", e.message);
     pub.dirty = true;
@@ -818,88 +846,6 @@ async function syncPublishedTrip(trip) {
 }
 async function syncAllDirty() {
   for (const t of trips) if (t.published?.dirty) await syncPublishedTrip(t);
-}
-
-/* ---------------- editor mode (open a shared trip to edit) ---------------- */
-function parseEditHash() {
-  const m = location.hash.match(/^#\/edit\/([A-Za-z0-9_-]+)$/);
-  return m ? m[1] : null;
-}
-const authedTrips = new Set();
-// refresh the 48h view cookies for an adopted trip so its remote images load
-async function ensureEditorCookies(trip) {
-  if (!trip?.published?.editKey || authedTrips.has(trip.published.id)) return;
-  const ps = await idb.byIndex("photos", "tripId", trip.id);
-  if (!ps.some(p => p.remote)) return; // no remote images → no cookies needed
-  try {
-    const r = await fetch("/api/auth", {
-      method: "POST", headers: { "content-type": "application/json" }, credentials: "include",
-      body: JSON.stringify({ tripId: trip.published.id, password: trip.published.editKey }),
-    });
-    if (r.ok) authedTrips.add(trip.published.id);
-  } catch { }
-}
-// merge a shared trip into local storage as an editable trip
-async function adoptTripLocally(id, code, data) {
-  let local = trips.find(t => t.published?.id === id);
-  if (!local) {
-    local = { id: uid(), name: data.name || "Shared trip", createdAt: Date.now(),
-      published: { id, editKey: code, viewPassword: "", uploadedIds: [], dirty: false }, dayNotes: {}, track: [] };
-  }
-  local.name = data.name || local.name;
-  local.published.editKey = code;
-  local.dayNotes = data.dayNotes || {};
-  local.track = data.track || [];
-  await idb.put("trips", local);
-  const serverIds = new Set((data.photos || []).map(p => p.id));
-  const localPhotos = await idb.byIndex("photos", "tripId", local.id);
-  const localById = new Map(localPhotos.map(p => [p.id, p]));
-  for (const lp of localPhotos) if (lp.remote && !serverIds.has(lp.id)) await idb.del("photos", lp.id);
-  for (const pm of (data.photos || [])) {
-    const ex = localById.get(pm.id);
-    if (ex && !ex.remote) continue; // her own uploaded photo — keep the local blob
-    await idb.put("photos", {
-      id: pm.id, tripId: local.id, name: pm.name, ts: pm.ts, lat: pm.lat, lng: pm.lng, caption: pm.caption || "",
-      thumbSrc: `/trips/${id}/thumbs/${pm.id}`, fullSrc: `/trips/${id}/photos/${pm.id}`, remote: true,
-    });
-  }
-  local.published.uploadedIds = [...serverIds];
-  await idb.put("trips", local);
-  if (!trips.find(t => t.id === local.id)) trips.unshift(local);
-  authedTrips.add(id);
-  await switchTrip(local.id);
-}
-async function adoptEditorTrip(id) {
-  const existing = trips.find(t => t.published?.id === id);
-  if (existing?.published?.editKey) {
-    // already adopted — refresh silently using the stored code
-    try {
-      const r = await fetch("/api/auth", { method: "POST", headers: { "content-type": "application/json" },
-        credentials: "include", body: JSON.stringify({ tripId: id, password: existing.published.editKey }) });
-      if (r.ok) { const data = await r.json(); if (data.role === "editor") { await adoptTripLocally(id, existing.published.editKey, data); toast("Opened for editing"); return; } }
-    } catch { }
-  }
-  const dlg = $("dlgPass");
-  $("dlgPassTitle").textContent = "Enter editor code";
-  const p = dlg.querySelector("p"); if (p) p.textContent = "Enter the editor code to add or edit photos in this trip.";
-  $("viewPass").value = "";
-  const go = async () => {
-    const code = $("viewPass").value; if (!code) return;
-    dlg.close(); busy("Opening trip for editing…");
-    try {
-      const r = await fetch("/api/auth", { method: "POST", headers: { "content-type": "application/json" },
-        credentials: "include", body: JSON.stringify({ tripId: id, password: code }) });
-      if (r.status === 401) { busy(false); toast("Wrong code"); return; }
-      if (!r.ok) throw new Error("auth " + r.status);
-      const data = await r.json();
-      if (data.role !== "editor") { busy(false); toast("That's a view password — you need the editor code"); return; }
-      await adoptTripLocally(id, code, data);
-      busy(false); toast("Opened for editing");
-    } catch (e) { console.error(e); busy(false); toast("Couldn't open trip"); }
-  };
-  $("btnPassOk").onclick = go;
-  $("viewPass").onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); go(); } };
-  dlg.showModal();
 }
 
 /* ---------------- shared-trip viewer mode ---------------- */
@@ -986,6 +932,64 @@ async function startViewer(tripId) {
   else dlg.showModal();
 }
 
+/* ---------------- owner auth ---------------- */
+async function apiMe() {
+  try { const r = await fetch("/api/me", { credentials: "same-origin" }); return r.ok ? await r.json() : null; } catch { return null; }
+}
+async function apiLogout() {
+  try { await fetch("/api/logout", { method: "POST", credentials: "same-origin" }); } catch { }
+  location.reload();
+}
+function updateAccountChip() {
+  const el = $("acctLine");
+  if (el) el.textContent = account ? `Signed in as ${account.name || account.username}` : "";
+}
+function showLogin() {
+  return new Promise(resolve => {
+    const dlg = $("dlgLogin"), err = $("loginError");
+    let chosen = "tom";
+    const set = u => { chosen = u; document.querySelectorAll("#loginWho .who").forEach(b => b.classList.toggle("active", b.dataset.u === u)); };
+    document.querySelectorAll("#loginWho .who").forEach(b => b.onclick = () => set(b.dataset.u));
+    set("tom"); err.textContent = ""; $("loginPass").value = "";
+    const go = async () => {
+      const pw = $("loginPass").value; if (!pw) return;
+      err.textContent = ""; busy("Signing in…");
+      let res = null;
+      try { const r = await fetch("/api/login", { method: "POST", headers: { "content-type": "application/json" }, credentials: "same-origin", body: JSON.stringify({ username: chosen, password: pw }) }); if (r.ok) res = await r.json(); } catch { }
+      busy(false);
+      if (!res) { err.textContent = "Wrong username or password."; return; }
+      account = { username: res.username, initials: res.initials, name: res.name };
+      dlg.close();
+      if (res.mustChangePw) await showChangePw(pw);
+      resolve();
+    };
+    $("btnLoginGo").onclick = go;
+    $("loginPass").onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); go(); } };
+    dlg.showModal();
+  });
+}
+function showChangePw(prefillCurrent) {
+  return new Promise(resolve => {
+    const dlg = $("dlgChangePw"), err = $("cpwError");
+    $("cpwCurrent").value = prefillCurrent || ""; $("cpwNew").value = ""; $("cpwConfirm").value = ""; err.textContent = "";
+    const go = async () => {
+      const cur = $("cpwCurrent").value, a = $("cpwNew").value, b = $("cpwConfirm").value;
+      if (!cur) { err.textContent = "Enter your current password."; return; }
+      if (a.length < 6) { err.textContent = "New password: at least 6 characters."; return; }
+      if (a !== b) { err.textContent = "New passwords don't match."; return; }
+      busy("Updating password…");
+      let r; try { r = await fetch("/api/change-password", { method: "POST", headers: { "content-type": "application/json" }, credentials: "same-origin", body: JSON.stringify({ currentPassword: cur, newPassword: a }) }); } catch { }
+      busy(false);
+      if (!r || r.status === 401) { err.textContent = "Current password is wrong."; return; }
+      if (!r.ok) { err.textContent = "Couldn't update password."; return; }
+      dlg.close(); toast("Password updated"); resolve();
+    };
+    $("btnCpwGo").onclick = go;
+    $("btnCpwCancel").onclick = () => { dlg.close(); resolve(); };
+    dlg.showModal();
+  });
+}
+
 /* ---------------- wiring ---------------- */
 async function main() {
   if (typeof L === "undefined")
@@ -1001,16 +1005,23 @@ async function main() {
 
   const viewerTripId = parseViewerHash();
   if (viewerTripId) { await startViewer(viewerTripId); return; }
-  const editTripId = parseEditHash();
 
-  // owner / editor mode
+  // owner mode — require login
   if (navigator.storage?.persist) navigator.storage.persist();
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(console.warn);
 
+  let me = await apiMe();
+  if (me) {
+    account = { username: me.username, initials: me.initials, name: me.name };
+    if (me.mustChangePw) await showChangePw();
+  } else {
+    await showLogin();
+  }
+  updateAccountChip();
+
   await loadTrips();
-  await ensureEditorCookies(trips.find(t => t.id === currentTripId));
-  await loadPhotos();
-  renderAll();
+  if (currentTripId) await switchTrip(currentTripId);   // loads the trip's photos from the cloud
+  else { await loadPhotos(); renderAll(); }
   await drainInbox();
   syncAllDirty();
 
@@ -1027,24 +1038,22 @@ async function main() {
     promptName("New trip", "", name => createTrip(name));
   };
   $("btnShare").onclick = () => {
-    if (!currentTripId || !photos.length) { toast("Add some photos to a trip first"); return; }
+    if (!currentTripId) { toast("Create or open a trip first"); return; }
     const trip = trips.find(t => t.id === currentTripId);
-    const pub = trip.published;
     $("shareForm").style.display = "block";
     $("shareResult").style.display = "none";
-    $("sharePass").value = (pub && (pub.viewPassword || pub.password)) || "";
-    $("shareEdit").value = (pub && (pub.editKey || pub.password)) || "";
+    $("sharePass").value = trip.viewPassword || "";
     $("dlgShare").showModal();
   };
   $("btnShareCancel").onclick = () => $("dlgShare").close();
   $("btnShareClose").onclick = () => $("dlgShare").close();
   $("btnSharePublish").onclick = () => {
-    const vp = $("sharePass").value.trim(), ek = $("shareEdit").value.trim();
+    const vp = $("sharePass").value.trim();
     if (vp.length < 4) { toast("View password must be at least 4 characters"); return; }
-    if (ek.length < 4) { toast("Editor code must be at least 4 characters"); return; }
-    if (vp === ek) { toast("Make the editor code different from the view password"); return; }
-    publishTrip(vp, ek);
+    publishTrip(vp);
   };
+  $("btnLogout").onclick = apiLogout;
+  $("btnChangePw").onclick = () => { $("dlgTrips").close(); showChangePw(); };
   $("btnPhotoDelete").onclick = async () => {
     if (!photoViewCurrent || viewerMode) return;
     await idb.del("photos", photoViewCurrent.id);
@@ -1062,9 +1071,6 @@ async function main() {
   navigator.serviceWorker?.addEventListener("message", ev => {
     if (ev.data === "inbox-updated") drainInbox();
   });
-
-  // opened via an editor link? adopt the shared trip for editing
-  if (editTripId) await adoptEditorTrip(editTripId);
 }
 
 main().catch(e => {
