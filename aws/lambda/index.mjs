@@ -80,7 +80,7 @@ export const handler = async (event) => {
   try {
     /* ---------- POST /api/publish ---------- */
     if (method === "POST" && path.endsWith("/publish")) {
-      const { tripId, password, name, photos, need } = body;
+      const { tripId, password, name, photos, need, dayNotes } = body;
       if (!password || String(password).length < 4) return json(400, { error: "password too short" });
       if (!name || !Array.isArray(photos)) return json(400, { error: "missing name/photos" });
       if (photos.length > 2000) return json(400, { error: "too many photos" });
@@ -91,7 +91,18 @@ export const handler = async (event) => {
         ts: typeof p.ts === "number" ? p.ts : null,
         lat: typeof p.lat === "number" ? p.lat : null,
         lng: typeof p.lng === "number" ? p.lng : null,
+        caption: String(p.caption || "").slice(0, 500),
       }));
+
+      // day notes: a small map of dayKey -> short text (owner-authored)
+      const cleanNotes = {};
+      if (dayNotes && typeof dayNotes === "object") {
+        for (const [k, v] of Object.entries(dayNotes)) {
+          if (typeof v === "string" && v.trim()) {
+            cleanNotes[String(k).slice(0, 20)] = v.slice(0, 500);
+          }
+        }
+      }
 
       let id, salt, hash;
       if (tripId) {
@@ -107,7 +118,7 @@ export const handler = async (event) => {
 
       await ddb.send(new PutCommand({
         TableName: TABLE,
-        Item: { tripId: id, name: String(name).slice(0, 80), photos: clean, salt, hash, updatedAt: Date.now() },
+        Item: { tripId: id, name: String(name).slice(0, 80), photos: clean, dayNotes: cleanNotes, salt, hash, updatedAt: Date.now() },
       }));
 
       // presigned direct-to-S3 upload URLs (only for the ids the client still needs)
@@ -147,7 +158,7 @@ export const handler = async (event) => {
         `CloudFront-Signature=${signed["CloudFront-Signature"]}; ${attrs}`,
         `CloudFront-Key-Pair-Id=${signed["CloudFront-Key-Pair-Id"]}; ${attrs}`,
       ];
-      return json(200, { id, name: rec.name, photos: rec.photos }, { cookies });
+      return json(200, { id, name: rec.name, photos: rec.photos, dayNotes: rec.dayNotes || {} }, { cookies });
     }
 
     return json(405, { error: "method not allowed" });
