@@ -184,7 +184,7 @@ export const handler = async (event) => {
       do {
         const out = await ddb.send(new ScanCommand({
           TableName: TABLE, ExclusiveStartKey: start,
-          ProjectionExpression: "tripId, #n, updatedAt, photos, dayNotes, disabled, viewCount, uniqueCount, lastAccess",
+          ProjectionExpression: "tripId, #n, updatedAt, photos, dayNotes, disabled, shared, viewCount, uniqueCount, lastAccess, dailyViews",
           ExpressionAttributeNames: { "#n": "name" },
         }));
         for (const t of out.Items || []) items.push(t);
@@ -193,8 +193,9 @@ export const handler = async (event) => {
       const trips = items.map(t => ({
         id: t.tripId, name: t.name, updatedAt: t.updatedAt || 0,
         photoCount: Array.isArray(t.photos) ? t.photos.length : 0,
-        disabled: !!t.disabled,
+        disabled: !!t.disabled, shared: !!t.shared,
         viewCount: t.viewCount || 0, uniqueCount: t.uniqueCount || 0, lastAccess: t.lastAccess || null,
+        dailyViews: t.dailyViews || {},
       })).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
       return json(200, { trips });
     }
@@ -260,6 +261,8 @@ export const handler = async (event) => {
         photos: clean, dayNotes: cleanNotes, track: cleanTrack,
         disabled: typeof body.disabled === "boolean" ? body.disabled : (rec?.disabled || false),
         viewCount: rec?.viewCount || 0, uniqueCount: rec?.uniqueCount || 0, lastAccess: rec?.lastAccess || null,
+        dailyViews: rec?.dailyViews || {},
+        shared: !!salt,                       // has a family view password
         updatedAt: Date.now(),
       };
       if (salt) { item.salt = salt; item.hash = hash; }
@@ -302,14 +305,19 @@ export const handler = async (event) => {
       let extraCookies = [];
       if (role === "viewer") {
         const seen = (event.cookies || []).some(c => c.startsWith(`rt_v_${id}=`));
+        // per-day bucket (recompute the whole map to avoid nested-path issues
+        // and to work for trips created before daily tracking existed)
+        const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+        const dv = rec.dailyViews || {};
+        dv[today] = (dv[today] || 0) + 1;
         const expr = seen
-          ? "ADD viewCount :one SET lastAccess = :now"
-          : "ADD viewCount :one, uniqueCount :one SET lastAccess = :now";
+          ? "ADD viewCount :one SET lastAccess = :now, dailyViews = :dv"
+          : "ADD viewCount :one, uniqueCount :one SET lastAccess = :now, dailyViews = :dv";
         try {
           await ddb.send(new UpdateCommand({
             TableName: TABLE, Key: { tripId: id },
             UpdateExpression: expr,
-            ExpressionAttributeValues: { ":one": 1, ":now": Date.now() },
+            ExpressionAttributeValues: { ":one": 1, ":now": Date.now(), ":dv": dv },
           }));
         } catch (e) { console.warn("stat update failed", e); }
         if (!seen) extraCookies.push(`rt_v_${id}=1; Domain=${CF_DOMAIN}; Path=/; Secure; SameSite=Lax; Max-Age=31536000`);
@@ -331,6 +339,21 @@ export const handler = async (event) => {
         ...extraCookies,
       ];
       return json(200, { id, role, name: rec.name, photos: rec.photos, dayNotes: rec.dayNotes || {}, track: rec.track || [] }, { cookies });
+    }
+
+    /* ---------- POST /api/set-disabled — activate/deactivate a share link (owner) ---------- */
+    if (method === "POST" && path.endsWith("/set-disabled")) {
+      const owner = await readSession(event);
+      if (!owner) return json(401, { error: "not logged in" });
+      const id = cleanId(body.tripId || "");
+      const rec = await getTrip(id);
+      if (!rec) return json(404, { error: "not found" });
+      await ddb.send(new UpdateCommand({
+        TableName: TABLE, Key: { tripId: id },
+        UpdateExpression: "SET disabled = :d",
+        ExpressionAttributeValues: { ":d": !!body.disabled },
+      }));
+      return json(200, { ok: true, disabled: !!body.disabled });
     }
 
     /* ---------- POST /api/unpublish — remove a shared trip entirely ---------- */
