@@ -91,8 +91,11 @@ async function processFile(fileBlob, name, tripId) {
       "GPSLatitude", "GPSLongitude", "GPSLatitudeRef", "GPSLongitudeRef"
     ]});
   } catch (e) { console.warn("EXIF parse failed for", name, e); }
-  const lat = meta && typeof meta.latitude === "number" ? meta.latitude : null;
-  const lng = meta && typeof meta.longitude === "number" ? meta.longitude : null;
+  // require FINITE numbers — some photos have partial GPS EXIF that parses to
+  // NaN, which is typeof "number" but would break the map; treat as no-location
+  let lat = meta && Number.isFinite(meta.latitude) ? meta.latitude : null;
+  let lng = meta && Number.isFinite(meta.longitude) ? meta.longitude : null;
+  if (lat === null || lng === null) { lat = null; lng = null; }
   const d = meta && (meta.DateTimeOriginal || meta.CreateDate || meta.ModifyDate);
   const ts = d instanceof Date && !isNaN(d) ? d.getTime() : null;
 
@@ -130,6 +133,9 @@ function thumbUrl(p) {
 function sortPhotos(list) {
   return list.slice().sort((a, b) => (a.ts ?? Infinity) - (b.ts ?? Infinity));
 }
+// a photo is "located" only with two finite coordinates (guards against NaN
+// from partial GPS EXIF, and against legacy NaN values already in storage)
+function hasGeo(p) { return Number.isFinite(p.lat) && Number.isFinite(p.lng); }
 
 /* ---------------- map ---------------- */
 function initMap() {
@@ -143,7 +149,7 @@ function initMap() {
 function renderMap() {
   markerLayer.clearLayers(); markersById = {};
   if (routeLine) { routeLine.remove(); routeLine = null; }
-  const located = photos.filter(p => p.lat != null && p.lng != null);
+  const located = photos.filter(hasGeo);
   if (!located.length) return;
 
   const pts = [];
@@ -180,11 +186,11 @@ function renderStrip() {
   const strip = $("strip"); strip.innerHTML = "";
   for (const p of photos) {
     const img = document.createElement("img");
-    img.className = "thumb" + (p.lat == null ? " nogps" : "");
+    img.className = "thumb" + (hasGeo(p) ? "" : " nogps");
     img.dataset.id = p.id; img.src = thumbUrl(p); img.loading = "lazy";
-    img.title = p.lat == null ? "No location in this photo" : fmtDate(p.ts);
+    img.title = hasGeo(p) ? fmtDate(p.ts) : "No location in this photo";
     img.onclick = () => {
-      if (p.lat != null && markersById[p.id]) {
+      if (hasGeo(p) && markersById[p.id]) {
         map.setView([p.lat, p.lng], Math.max(map.getZoom(), 12));
         markersById[p.id].openPopup();
       } else openPhotoView(p);
@@ -230,8 +236,8 @@ function renderGallery() {
       g.appendChild(day);
     }
     const cell = document.createElement("div");
-    cell.className = "gal-cell" + (p.lat == null ? " nogps" : "");
-    cell.title = p.lat == null ? "No location in this photo" : fmtDate(p.ts);
+    cell.className = "gal-cell" + (hasGeo(p) ? "" : " nogps");
+    cell.title = hasGeo(p) ? fmtDate(p.ts) : "No location in this photo";
     const img = document.createElement("img");
     img.src = thumbUrl(p); img.loading = "lazy"; img.alt = p.name || "photo";
     cell.appendChild(img);
@@ -345,7 +351,7 @@ async function importFiles(files) {
     busy(`Adding photo ${i + 1} / ${files.length}…`);
     try {
       const p = await processFile(files[i], files[i].name, tripId);
-      ok++; if (p.lat == null) noGps++;
+      ok++; if (!hasGeo(p)) noGps++;
     } catch (e) { console.error(e); }
   }
   busy(false);
@@ -362,7 +368,7 @@ async function drainInbox() {
     busy(`Importing shared photo ${i + 1} / ${items.length}…`);
     try {
       const p = await processFile(items[i].blob, items[i].name, tripId);
-      ok++; if (p.lat == null) noGps++;
+      ok++; if (!hasGeo(p)) noGps++;
     } catch (e) { console.error(e); }
     await idb.del("inbox", items[i].id);
   }
@@ -388,7 +394,7 @@ async function openPhotoView(p) {
   } else { toast("Could not load this photo"); return; }
   photoViewCurrent = p;
   $("photoViewImg").src = src;
-  $("photoViewCap").textContent = fmtDate(p.ts) + (p.lat == null ? " · no location" : "");
+  $("photoViewCap").textContent = fmtDate(p.ts) + (hasGeo(p) ? "" : " · no location");
   $("btnPhotoDelete").style.display = viewerMode ? "none" : "";
   $("photoView").classList.add("open");
 }
