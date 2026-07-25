@@ -1,0 +1,73 @@
+name: Deploy
+
+# Every push to main deploys the whole app:
+#   1. SAM builds + deploys the backend (Lambda + infra) — idempotent, so a
+#      frontend-only push is a cheap no-op changeset.
+#   2. The PWA in public/ is synced to the S3 site bucket and CloudFront is
+#      invalidated so the new shell goes live immediately.
+# Auth uses a short-lived GitHub OIDC role (no long-lived AWS keys in GitHub).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write      # required to request the OIDC token
+  contents: read
+
+env:
+  AWS_REGION: eu-west-1
+  STACK: roadtrip
+  CF_PUBLIC_KEY_SSM: /roadtrip/cf-public-key
+  CF_DOMAIN: trips.tombolek.com
+  CUSTOM_DOMAIN: trips.tombolek.com
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Deploy backend (SAM)
+        working-directory: aws
+        run: |
+          sam build
+          sam deploy \
+            --stack-name "$STACK" \
+            --region "$AWS_REGION" \
+            --resolve-s3 \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides \
+              CloudFrontPublicKey="$CF_PUBLIC_KEY_SSM" \
+              PrivateKeySecretArn="${{ secrets.PRIVATE_KEY_SECRET_ARN }}" \
+              CFDomain="$CF_DOMAIN" \
+              CustomDomain="$CUSTOM_DOMAIN" \
+              AcmCertArn="${{ secrets.ACM_CERT_ARN }}"
+
+      - name: Deploy site (S3 sync + CloudFront invalidation)
+        run: |
+          SITE=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='SiteBucketName'].OutputValue" --output text)
+          DIST=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='DistributionId'].OutputValue" --output text)
+          echo "Syncing public/ -> s3://$SITE  (distribution $DIST)"
+          aws s3 sync public "s3://$SITE/" --delete
+          aws cloudfront create-invalidation --distribution-id "$DIST" --paths "/*"
