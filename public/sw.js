@@ -4,7 +4,7 @@
    2. Caches the app shell + CDN libs for offline use. */
 "use strict";
 
-const CACHE = "roadtrip-v9";
+const CACHE = "roadtrip-v10";
 const SHELL = [
   "/", "/index.html", "/app.js", "/manifest.webmanifest",
   "/icons/icon-192.png", "/icons/icon-512.png",

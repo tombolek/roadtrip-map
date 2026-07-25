@@ -116,7 +116,7 @@ async function processFile(fileBlob, name, tripId) {
 
 /* ---------------- state ---------------- */
 let trips = [], currentTripId = null, photos = [];   // photos = current trip, sorted
-let map, markerLayer, routeLine, markersById = {};
+let map, markerLayer, routeLine, trackLine, markersById = {};
 const objUrls = new Map(); // photoId -> object URL (thumbs)
 let viewerMode = null; // { id, pass, name } when viewing a shared trip
 
@@ -137,6 +137,88 @@ function sortPhotos(list) {
 // from partial GPS EXIF, and against legacy NaN values already in storage)
 function hasGeo(p) { return Number.isFinite(p.lat) && Number.isFinite(p.lng); }
 
+/* ---------------- Google Timeline import (real route) ---------------- */
+function parseGeoString(s) {
+  if (s && typeof s === "object") s = s.latLng || s.latlng || s;   // some formats nest it
+  if (typeof s !== "string") return null;
+  let m = s.match(/(-?\d+\.\d+)\s*°?\s*,\s*(-?\d+\.\d+)\s*°?/); // "geo:lat,lng" or "lat°, lng°"
+  if (!m) return null;
+  const lat = parseFloat(m[1]), lng = parseFloat(m[2]);
+  return (Number.isFinite(lat) && Number.isFinite(lng)) ? [lat, lng] : null;
+}
+// pull {lat,lng,t} points out of the various Google Timeline export shapes
+function extractTrack(json) {
+  const pts = [];
+  const push = (g, t) => { if (g) pts.push({ lat: g[0], lng: g[1], t: t || 0 }); };
+  // Format 1 — Takeout Records.json / Location History
+  if (json && Array.isArray(json.locations)) {
+    for (const l of json.locations) {
+      let lat = null, lng = null;
+      if (Number.isFinite(l.latitudeE7)) { lat = l.latitudeE7 / 1e7; lng = l.longitudeE7 / 1e7; }
+      else if (Number.isFinite(l.latitude)) { lat = l.latitude; lng = l.longitude; }
+      const t = l.timestamp ? Date.parse(l.timestamp) : (l.timestampMs ? +l.timestampMs : 0);
+      if (Number.isFinite(lat) && Number.isFinite(lng)) pts.push({ lat, lng, t: t || 0 });
+    }
+  }
+  // Format 2 — on-device semantic export (array, or {semanticSegments:[...]})
+  const segs = Array.isArray(json) ? json : (json && Array.isArray(json.semanticSegments) ? json.semanticSegments : null);
+  if (segs) {
+    for (const s of segs) {
+      const t = s.startTime ? Date.parse(s.startTime) : 0;
+      if (Array.isArray(s.timelinePath)) for (const p of s.timelinePath) push(parseGeoString(p.point), t);
+      if (s.activity) { push(parseGeoString(s.activity.start), t); push(parseGeoString(s.activity.end), t); }
+      if (s.visit && s.visit.topCandidate) push(parseGeoString(s.visit.topCandidate.placeLocation), t);
+    }
+  }
+  return pts;
+}
+async function importTimelineFile(file) {
+  const trip = currentTrip();
+  if (!trip) { toast("Create or open a trip first"); return; }
+  busy("Reading timeline…");
+  let json;
+  try { json = JSON.parse(await file.text()); }
+  catch { busy(false); toast("That doesn't look like a JSON export"); return; }
+  let raw = extractTrack(json);
+  if (!raw.length) { busy(false); toast("No location points found in that file"); return; }
+  raw.sort((a, b) => (a.t || 0) - (b.t || 0));
+  // clip to the trip's photo date range (±1 day) when both have timestamps
+  const photoTs = photos.map(p => p.ts).filter(Boolean);
+  if (photoTs.length && raw.some(p => p.t > 0)) {
+    const lo = Math.min(...photoTs) - 864e5, hi = Math.max(...photoTs) + 864e5;
+    const clipped = raw.filter(p => p.t >= lo && p.t <= hi);
+    if (clipped.length >= 2) raw = clipped;
+  }
+  // downsample so the stored/synced route stays small
+  const MAXP = 800;
+  let coords = raw.map(p => [p.lat, p.lng]);
+  if (coords.length > MAXP) { const step = Math.ceil(coords.length / MAXP); coords = coords.filter((_, i) => i % step === 0); }
+  trip.track = coords;
+  await idb.put("trips", trip);
+  busy(false);
+  $("dlgTrips").close();
+  setView("map");
+  renderAll();
+  markDirtyAndSync(currentTripId);
+  toast(`Imported route (${coords.length} points)`);
+}
+async function clearTimeline() {
+  const trip = currentTrip();
+  if (!trip || !trip.track?.length) { toast("No route to clear"); return; }
+  trip.track = [];
+  await idb.put("trips", trip);
+  renderTripList(); updateRouteStatus(); renderAll(); markDirtyAndSync(currentTripId);
+  toast("Route cleared");
+}
+function tripTrack() {
+  return viewerMode ? viewerTrack : (currentTrip()?.track || []);
+}
+function updateRouteStatus() {
+  const el = $("routeStatus"); if (!el) return;
+  const n = currentTrip()?.track?.length || 0;
+  el.textContent = n ? `· ${n} points imported` : "· none yet";
+}
+
 /* ---------------- map ---------------- */
 function initMap() {
   map = L.map("map", { zoomControl: false }).setView([48.8, 16.6], 5);
@@ -145,12 +227,39 @@ function initMap() {
     maxZoom: 19, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
   }).addTo(map);
   markerLayer = L.layerGroup().addTo(map);
+  map.on("click", onMapClick);
+}
+
+/* ---- manually place a photo without (or with wrong) GPS ---- */
+let placingPhotoId = null;
+function startPlacing(p) {
+  if (viewerMode || !p) return;
+  placingPhotoId = p.id;
+  closePhotoView();
+  setView("map");
+  $("placeBanner").classList.remove("hidden");
+  $("placeBannerText").textContent = `Tap the map to place this photo`;
+}
+function stopPlacing() { placingPhotoId = null; $("placeBanner").classList.add("hidden"); }
+async function onMapClick(e) {
+  if (!placingPhotoId) return;
+  const p = photos.find(x => x.id === placingPhotoId) || await idb.get("photos", placingPhotoId);
+  stopPlacing();
+  if (!p) return;
+  p.lat = e.latlng.lat; p.lng = e.latlng.lng;
+  await idb.put("photos", p);
+  await loadPhotos(); renderAll();
+  markDirtyAndSync(currentTripId);
+  if (markersById[p.id]) markersById[p.id].openPopup();
+  toast("Location set");
 }
 function renderMap() {
   markerLayer.clearLayers(); markersById = {};
   if (routeLine) { routeLine.remove(); routeLine = null; }
+  if (trackLine) { trackLine.remove(); trackLine = null; }
   const located = photos.filter(hasGeo);
-  if (!located.length) return;
+  const track = tripTrack();
+  if (!located.length && track.length < 2) return;
 
   const pts = [];
   for (const p of located) {
@@ -173,8 +282,15 @@ function renderMap() {
     m.on("popupopen", () => setActiveThumb(p.id));
     markersById[p.id] = m;
   }
-  routeLine = L.polyline(pts, { color: "#0e7490", weight: 3.5, opacity: .85, dashArray: "8 7" }).addTo(map);
-  map.fitBounds(routeLine.getBounds(), { padding: [50, 50], maxZoom: 14 });
+  if (track.length >= 2) {
+    // real driven route from Google Timeline — solid line, replaces the
+    // straight-line connector; markers still sit on top
+    trackLine = L.polyline(track, { color: "#0e7490", weight: 4, opacity: .8 }).addTo(map);
+  } else if (pts.length >= 2) {
+    routeLine = L.polyline(pts, { color: "#0e7490", weight: 3.5, opacity: .85, dashArray: "8 7" }).addTo(map);
+  }
+  const all = pts.concat(track);
+  if (all.length) map.fitBounds(L.latLngBounds(all), { padding: [50, 50], maxZoom: 14 });
 }
 function setActiveThumb(id) {
   document.querySelectorAll("#strip .thumb").forEach(el =>
@@ -206,6 +322,7 @@ let currentView = "map"; // "map" | "gallery"
 let selectMode = false;                 // owner batch-select in gallery
 const selectedIds = new Set();
 let viewerDayNotes = {};                 // day notes when viewing a shared trip
+let viewerTrack = [];                     // real route [[lat,lng]...] when viewing a shared trip
 
 function currentTrip() { return trips.find(t => t.id === currentTripId); }
 function getDayNote(key) {
@@ -383,8 +500,33 @@ async function ensureTrip() {
   const t = await createTrip("My trip");
   return t.id;
 }
+async function unpublishTrip(t) {
+  if (!t.published) return;
+  if (!confirm(`Take down the shared link for “${t.name}”? Family will no longer be able to open it.`)) return;
+  busy("Removing shared trip…");
+  try {
+    const r = await fetch("/api/unpublish", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tripId: t.published.id, password: t.published.password }),
+    });
+    if (r.status === 401) { busy(false); toast("Password mismatch — couldn't remove"); return; }
+    if (!r.ok) throw new Error("unpublish failed " + r.status);
+    t.published = null;
+    await idb.put("trips", t);
+    busy(false); renderTripSelect(); renderTripList();
+    toast("Shared link removed");
+  } catch (e) { console.error(e); busy(false); toast("Couldn't remove shared trip — try again"); }
+}
 async function deleteTrip(t) {
   if (!confirm(`Delete trip “${t.name}” and its photos from this device?`)) return;
+  if (t.published && confirm(`Also remove the shared online copy so the link stops working for family?`)) {
+    try {
+      await fetch("/api/unpublish", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ tripId: t.published.id, password: t.published.password }),
+      });
+    } catch (e) { console.warn("remote unpublish failed", e); }
+  }
   const ps = await idb.byIndex("photos", "tripId", t.id);
   for (const p of ps) await idb.del("photos", p.id);
   await idb.del("trips", t.id);
@@ -406,9 +548,15 @@ function renderTripList() {
       t.name = name; await idb.put("trips", t); renderTripSelect(); renderTripList();
       markDirtyAndSync(t.id);
     });
+    row.append(nm, open, ren);
+    if (t.published) {
+      const uns = document.createElement("button"); uns.className = "btn btn-ghost"; uns.textContent = "Unshare";
+      uns.onclick = () => unpublishTrip(t);
+      row.append(uns);
+    }
     const del = document.createElement("button"); del.className = "btn btn-warn"; del.textContent = "✕";
     del.onclick = () => deleteTrip(t);
-    row.append(nm, open, ren, del); box.appendChild(row);
+    row.append(del); box.appendChild(row);
   }
 }
 function promptName(title, initial, cb) {
@@ -485,6 +633,7 @@ function showPhotoAt(i) {
   cap.readOnly = !!viewerMode;
   cap.placeholder = viewerMode ? "" : "Add a caption…";
   $("btnPhotoDelete").style.display = viewerMode ? "none" : "";
+  $("btnPhotoLocate").textContent = hasGeo(p) ? "Move location" : "Set location";
   $("pvPrev").disabled = i <= 0;
   $("pvNext").disabled = i >= photos.length - 1;
   $("photoView").classList.add("open");
@@ -502,6 +651,8 @@ function initPhotoViewControls() {
   $("btnPhotoClose").onclick = closePhotoView;
   $("pvPrev").onclick = () => showPhotoAt(photoViewIndex - 1);
   $("pvNext").onclick = () => showPhotoAt(photoViewIndex + 1);
+  $("btnPhotoLocate").onclick = () => startPlacing(photoViewCurrent);
+  $("placeCancel").onclick = stopPlacing;
   document.addEventListener("keydown", e => {
     if (!$("photoView").classList.contains("open")) return;
     if (e.key === "Escape") closePhotoView();
@@ -554,6 +705,7 @@ async function publishTrip(pass) {
         name: trip.name,
         photos: list.map(p => ({ id: p.id, name: p.name, ts: p.ts, lat: p.lat, lng: p.lng, caption: p.caption || "" })),
         dayNotes: trip.dayNotes || {},
+        track: trip.track || [],
         need: list.map(p => p.id),
       }),
     });
@@ -639,6 +791,7 @@ async function syncPublishedTrip(trip) {
         name: trip.name,
         photos: list.map(p => ({ id: p.id, name: p.name, ts: p.ts, lat: p.lat, lng: p.lng, caption: p.caption || "" })),
         dayNotes: trip.dayNotes || {},
+        track: trip.track || [],
         need,
       }),
     });
@@ -719,6 +872,7 @@ async function startViewer(tripId) {
       const data = await r.json();
       viewerMode = { id: tripId, pass, name: data.name };
       viewerDayNotes = data.dayNotes || {};
+      viewerTrack = Array.isArray(data.track) ? data.track : [];
       $("viewerTitle").textContent = data.name;
       document.title = data.name + " — Roadtrip Map";
       // no per-image fetching: thumbnails + full photos are plain CDN URLs, the
@@ -775,7 +929,10 @@ async function main() {
   $("tripSelect").onchange = e => switchTrip(e.target.value);
   $("btnAdd").onclick = () => $("filePick").click();
   $("filePick").onchange = e => { importFiles([...e.target.files]); e.target.value = ""; };
-  $("btnTrips").onclick = () => { renderTripList(); $("dlgTrips").showModal(); };
+  $("btnTrips").onclick = () => { renderTripList(); updateRouteStatus(); $("dlgTrips").showModal(); };
+  $("btnImportTimeline").onclick = () => $("timelinePick").click();
+  $("timelinePick").onchange = e => { const f = e.target.files[0]; e.target.value = ""; if (f) importTimelineFile(f); };
+  $("btnClearTimeline").onclick = clearTimeline;
   $("btnTripsClose").onclick = () => $("dlgTrips").close();
   $("btnNewTrip").onclick = () => {
     $("dlgTrips").close();

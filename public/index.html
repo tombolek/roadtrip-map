@@ -103,6 +103,11 @@
   .trip-row span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .trip-row small { color: var(--muted); flex: none; }
   .trip-row button { padding: 5px 9px; font-size: 13px; }
+  #routeSection { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 12px; }
+  .route-label { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+  .route-status { font-weight: 400; color: var(--muted); }
+  .route-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .route-hint { font-size: 12px; color: var(--muted); margin-top: 8px; line-height: 1.4; }
   #shareResult { display: none; }
   #shareLink {
     font-size: 13px; background: #f1f5f9; padding: 10px; border-radius: 10px;
@@ -141,8 +146,20 @@
   }
   body.viewer #pvCaption[readonly] { border-color: transparent; background: transparent; padding-left: 0; color: #f1f5f9; font-size: 15px; }
   #pvCaption[readonly]:placeholder-shown { display: none; }
-  .bar-actions { display: flex; justify-content: flex-end; }
+  .bar-actions { display: flex; justify-content: flex-end; gap: 8px; }
   body.viewer .bar-actions { display: none; }
+  /* manual-placement banner */
+  #placeBanner {
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 1200;
+    display: flex; align-items: center; gap: 10px; max-width: 92vw;
+    background: var(--teal-dark); color: #fff; padding: 9px 12px; border-radius: 10px;
+    font-size: 13px; box-shadow: 0 4px 16px rgba(0,0,0,.3);
+  }
+  #placeBanner.hidden { display: none; }
+  #placeBanner button {
+    border: none; background: rgba(255,255,255,.18); color: #fff; border-radius: 7px;
+    padding: 5px 10px; font-size: 13px; cursor: pointer; flex: none;
+  }
   #toast {
     position: fixed; left: 50%; bottom: 100px; transform: translateX(-50%);
     background: #0f172a; color: #fff; padding: 10px 18px; border-radius: 999px;
@@ -251,15 +268,28 @@
   </div>
   <div id="strip"></div>
   <div id="gallery" class="hidden"></div>
+  <div id="placeBanner" class="hidden">
+    <span id="placeBannerText">Tap the map to place this photo</span>
+    <button id="placeCancel">Cancel</button>
+  </div>
 </main>
 
 <!-- No accept="image/*": on Android that forces the Photos picker, which strips
      GPS. Omitting it opens the Files/document chooser so originals keep EXIF. -->
 <input type="file" id="filePick" multiple hidden>
+<input type="file" id="timelinePick" accept=".json,application/json" hidden>
 
 <dialog id="dlgTrips">
   <h3>My trips</h3>
   <div id="tripList"></div>
+  <div id="routeSection">
+    <div class="route-label">Real route for the current trip <span class="route-status" id="routeStatus"></span></div>
+    <div class="route-actions">
+      <button class="btn btn-ghost" id="btnImportTimeline">Import Google Timeline…</button>
+      <button class="btn btn-ghost" id="btnClearTimeline">Clear route</button>
+    </div>
+    <div class="route-hint">Export on your phone: Settings → Location → Timeline → Export, then pick that JSON file here.</div>
+  </div>
   <div class="dlg-actions">
     <button class="btn btn-ghost" id="btnTripsClose">Close</button>
     <button class="btn btn-primary" id="btnNewTrip">New trip</button>
@@ -318,6 +348,7 @@
     <div id="photoViewCap"></div>
     <input id="pvCaption" type="text" maxlength="200" placeholder="Add a caption…">
     <div class="bar-actions">
+      <button class="btn btn-ghost" id="btnPhotoLocate">Set location</button>
       <button class="btn btn-warn" id="btnPhotoDelete">Delete</button>
     </div>
   </div>
