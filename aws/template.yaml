@@ -21,6 +21,17 @@ Parameters:
       CloudFront domain (e.g. d123.cloudfront.net). Leave blank on the first
       deploy, then re-deploy with the value from the CloudFrontDomain output so
       signed cookies are scoped to the right host.
+  CustomDomain:
+    Type: String
+    Default: ""
+    Description: Optional custom domain (e.g. trips.tombolek.com). Blank = use only the cloudfront.net name.
+  AcmCertArn:
+    Type: String
+    Default: ""
+    Description: ARN of a us-east-1 ACM cert covering CustomDomain. Required only when CustomDomain is set.
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref CustomDomain, ""]]
 
 Globals:
   Function:
@@ -129,6 +140,13 @@ Resources:
         DefaultRootObject: index.html
         HttpVersion: http2and3
         PriceClass: PriceClass_100
+        Aliases: !If [HasCustomDomain, [!Ref CustomDomain], !Ref "AWS::NoValue"]
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref AcmCertArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
         Origins:
           - Id: site
             DomainName: !GetAtt SiteBucket.RegionalDomainName
