@@ -482,8 +482,9 @@ async function loadTrips() {
   for (const ct of cloud) {
     const lt = byId.get(ct.id) || { id: ct.id, published: { id: ct.id, uploadedIds: [], dirty: false, loaded: false }, dayNotes: {}, track: [] };
     lt.name = ct.name; lt.createdAt = ct.updatedAt || lt.createdAt || Date.now();
-    lt.disabled = ct.disabled; lt.viewCount = ct.viewCount; lt.uniqueCount = ct.uniqueCount;
-    lt.lastAccess = ct.lastAccess; lt.photoCount = ct.photoCount;
+    lt.disabled = ct.disabled; lt.shared = ct.shared; lt.viewCount = ct.viewCount;
+    lt.uniqueCount = ct.uniqueCount; lt.lastAccess = ct.lastAccess;
+    lt.photoCount = ct.photoCount; lt.dailyViews = ct.dailyViews || {};
     await idb.put("trips", lt);
   }
   trips = (await idb.all("trips")).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
@@ -598,6 +599,75 @@ function renderTripList() {
     const del = document.createElement("button"); del.className = "btn btn-warn"; del.textContent = "✕";
     del.onclick = () => deleteTrip(t);
     row.append(nm, open, ren, del); box.appendChild(row);
+  }
+}
+/* ---------------- sharing & stats dashboard ---------------- */
+function weekViews(dailyViews) {
+  if (!dailyViews) return 0;
+  let total = 0;
+  const now = Date.now();
+  for (const [d, n] of Object.entries(dailyViews)) {
+    const t = Date.parse(d + "T00:00:00Z");
+    if (Number.isFinite(t) && now - t <= 7 * 864e5 + 864e5) total += n;
+  }
+  return total;
+}
+function relTime(ts) {
+  if (!ts) return "never";
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 90) return "just now";
+  const m = Math.floor(s / 60); if (m < 90) return `${m} min ago`;
+  const h = Math.floor(m / 60); if (h < 36) return `${h} h ago`;
+  return `${Math.floor(h / 24)} d ago`;
+}
+async function setDisabled(trip, disabled) {
+  busy(disabled ? "Deactivating link…" : "Reactivating link…");
+  try {
+    const r = await fetch("/api/set-disabled", {
+      method: "POST", headers: { "content-type": "application/json" }, credentials: "same-origin",
+      body: JSON.stringify({ tripId: trip.published.id, disabled }),
+    });
+    if (!r.ok) throw new Error("set-disabled " + r.status);
+    trip.disabled = disabled;
+    await idb.put("trips", trip);
+    busy(false); renderDashboard();
+    toast(disabled ? "Link deactivated" : "Link reactivated");
+  } catch (e) { console.error(e); busy(false); toast("Couldn't update — try again"); }
+}
+function renderDashboard() {
+  const box = $("dashList"); box.innerHTML = "";
+  if (!trips.length) { box.innerHTML = '<p class="dash-empty">No trips yet.</p>'; return; }
+  for (const t of trips) {
+    const link = `${location.origin}/#/trip/${t.published.id}`;
+    const card = document.createElement("div"); card.className = "dash-card" + (t.disabled ? " off" : "");
+    const head = document.createElement("div"); head.className = "dash-head";
+    const nm = document.createElement("div"); nm.className = "dash-name"; nm.textContent = t.name;
+    const status = document.createElement("span"); status.className = "dash-status";
+    status.textContent = !t.shared ? "not shared" : (t.disabled ? "deactivated" : "active");
+    head.append(nm, status);
+
+    const stats = document.createElement("div"); stats.className = "dash-stats";
+    stats.textContent = `👁 ${t.viewCount || 0} visits · ${t.uniqueCount || 0} unique · ${weekViews(t.dailyViews)} this week · last ${relTime(t.lastAccess)}`;
+
+    const actions = document.createElement("div"); actions.className = "dash-actions";
+    if (t.shared) {
+      const linkBox = document.createElement("div"); linkBox.className = "dash-link"; linkBox.textContent = link;
+      const copy = document.createElement("button"); copy.className = "btn btn-ghost"; copy.textContent = "Copy link";
+      copy.onclick = async () => {
+        const pw = t.viewPassword ? `\nPassword: ${t.viewPassword}` : "";
+        try { await navigator.clipboard.writeText(link + pw); toast("Link copied"); } catch { }
+      };
+      const toggle = document.createElement("button"); toggle.className = "btn btn-ghost";
+      toggle.textContent = t.disabled ? "Reactivate" : "Deactivate";
+      toggle.onclick = () => setDisabled(t, !t.disabled);
+      card.append(head, linkBox, stats);
+      actions.append(copy, toggle);
+    } else {
+      const hint = document.createElement("div"); hint.className = "dash-hint"; hint.textContent = "Not shared yet — open the trip and tap ↗ to set a view password.";
+      card.append(head, hint, stats);
+    }
+    card.appendChild(actions);
+    box.appendChild(card);
   }
 }
 function promptName(title, initial, cb) {
@@ -1054,6 +1124,8 @@ async function main() {
   };
   $("btnLogout").onclick = apiLogout;
   $("btnChangePw").onclick = () => { $("dlgTrips").close(); showChangePw(); };
+  $("btnDashboard").onclick = () => { $("dlgTrips").close(); renderDashboard(); $("dlgDashboard").showModal(); };
+  $("btnDashClose").onclick = () => $("dlgDashboard").close();
   $("btnPhotoDelete").onclick = async () => {
     if (!photoViewCurrent || viewerMode) return;
     await idb.del("photos", photoViewCurrent.id);

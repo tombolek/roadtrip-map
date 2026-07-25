@@ -253,6 +253,20 @@
   #acctLine { flex: 1; font-size: 13px; color: var(--muted); min-width: 120px; }
   .acct-actions { display: flex; gap: 8px; }
   .acct-actions .btn { padding: 6px 10px; font-size: 13px; }
+  /* sharing & stats dashboard */
+  #dashList { max-height: 60vh; overflow-y: auto; }
+  .dash-empty { color: var(--muted); font-size: 14px; }
+  .dash-card { border: 1px solid var(--line); border-radius: 12px; padding: 12px; margin-bottom: 10px; }
+  .dash-card.off { opacity: .7; background: #f8fafc; }
+  .dash-head { display: flex; align-items: center; gap: 8px; }
+  .dash-name { flex: 1; font-weight: 700; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dash-status { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; color: #16a34a; }
+  .dash-card.off .dash-status { color: #dc2626; }
+  .dash-link { font-size: 12px; background: #f1f5f9; border-radius: 8px; padding: 7px 9px; margin: 8px 0; word-break: break-all; user-select: all; }
+  .dash-hint { font-size: 12px; color: var(--muted); margin: 8px 0; }
+  .dash-stats { font-size: 12px; color: var(--muted); }
+  .dash-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .dash-actions .btn { padding: 6px 11px; font-size: 13px; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -313,12 +327,23 @@
     <button class="btn btn-ghost" id="btnTripsClose">Close</button>
     <button class="btn btn-primary" id="btnNewTrip">New trip</button>
   </div>
+  <div class="dlg-actions" style="justify-content:flex-start; margin-top:8px;">
+    <button class="btn btn-ghost" id="btnDashboard">Sharing &amp; stats</button>
+  </div>
   <div id="acctSection">
     <span id="acctLine"></span>
     <span class="acct-actions">
       <button class="btn btn-ghost" id="btnChangePw">Change password</button>
       <button class="btn btn-ghost" id="btnLogout">Log out</button>
     </span>
+  </div>
+</dialog>
+
+<dialog id="dlgDashboard">
+  <h3>Sharing &amp; stats</h3>
+  <div id="dashList"></div>
+  <div class="dlg-actions">
+    <button class="btn btn-primary" id="btnDashClose">Close</button>
   </div>
 </dialog>
 
