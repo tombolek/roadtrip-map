@@ -8,7 +8,7 @@
                           fetch images straight from the CDN (/trips/<id>/*).
    Secrets (password hashes) live only in DynamoDB; image bytes only in S3. */
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, GetCommand, PutCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
 import { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { getSignedCookies } from "@aws-sdk/cloudfront-signer";
@@ -80,10 +80,19 @@ export const handler = async (event) => {
   try {
     /* ---------- POST /api/publish ---------- */
     if (method === "POST" && path.endsWith("/publish")) {
-      const { tripId, password, name, photos, need, dayNotes } = body;
+      const { tripId, password, name, photos, need, dayNotes, track } = body;
       if (!password || String(password).length < 4) return json(400, { error: "password too short" });
       if (!name || !Array.isArray(photos)) return json(400, { error: "missing name/photos" });
       if (photos.length > 2000) return json(400, { error: "too many photos" });
+
+      // route track: array of [lat,lng] finite pairs, capped
+      let cleanTrack = [];
+      if (Array.isArray(track)) {
+        cleanTrack = track
+          .filter(pt => Array.isArray(pt) && Number.isFinite(pt[0]) && Number.isFinite(pt[1]))
+          .slice(0, 1000)
+          .map(pt => [Math.round(pt[0] * 1e5) / 1e5, Math.round(pt[1] * 1e5) / 1e5]);
+      }
 
       const clean = photos.map(p => ({
         id: cleanId(p.id),
@@ -118,7 +127,7 @@ export const handler = async (event) => {
 
       await ddb.send(new PutCommand({
         TableName: TABLE,
-        Item: { tripId: id, name: String(name).slice(0, 80), photos: clean, dayNotes: cleanNotes, salt, hash, updatedAt: Date.now() },
+        Item: { tripId: id, name: String(name).slice(0, 80), photos: clean, dayNotes: cleanNotes, track: cleanTrack, salt, hash, updatedAt: Date.now() },
       }));
 
       // presigned direct-to-S3 upload URLs (only for the ids the client still needs)
@@ -158,7 +167,26 @@ export const handler = async (event) => {
         `CloudFront-Signature=${signed["CloudFront-Signature"]}; ${attrs}`,
         `CloudFront-Key-Pair-Id=${signed["CloudFront-Key-Pair-Id"]}; ${attrs}`,
       ];
-      return json(200, { id, name: rec.name, photos: rec.photos, dayNotes: rec.dayNotes || {} }, { cookies });
+      return json(200, { id, name: rec.name, photos: rec.photos, dayNotes: rec.dayNotes || {}, track: rec.track || [] }, { cookies });
+    }
+
+    /* ---------- POST /api/unpublish — remove a shared trip entirely ---------- */
+    if (method === "POST" && path.endsWith("/unpublish")) {
+      const { tripId, password } = body;
+      const id = cleanId(tripId || "");
+      const rec = await getTrip(id);
+      if (!rec) return json(200, { ok: true });          // already gone — idempotent
+      if (!verify(password || "", rec)) return json(401, { error: "unauthorized" });
+      // delete all image objects, then the DynamoDB record
+      let token;
+      do {
+        const out = await s3.send(new ListObjectsV2Command({ Bucket: BUCKET, Prefix: `trips/${id}/`, ContinuationToken: token }));
+        const objs = (out.Contents || []).map(o => ({ Key: o.Key }));
+        if (objs.length) await s3.send(new DeleteObjectsCommand({ Bucket: BUCKET, Delete: { Objects: objs } }));
+        token = out.IsTruncated ? out.NextContinuationToken : undefined;
+      } while (token);
+      await ddb.send(new DeleteCommand({ TableName: TABLE, Key: { tripId: id } }));
+      return json(200, { ok: true });
     }
 
     return json(405, { error: "method not allowed" });
