@@ -114,12 +114,35 @@
     display: none; flex-direction: column;
   }
   #photoView.open { display: flex; }
-  #photoView img { flex: 1; min-height: 0; object-fit: contain; width: 100%; }
+  #pvStage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; touch-action: pan-y; }
+  #photoView img { max-height: 100%; max-width: 100%; object-fit: contain; user-select: none; -webkit-user-drag: none; }
+  #btnPhotoClose {
+    position: absolute; top: calc(8px + env(safe-area-inset-top)); right: 10px; z-index: 3;
+    width: 40px; height: 40px; border-radius: 50%; border: none; cursor: pointer;
+    background: rgba(0,0,0,.5); color: #fff; display: flex; align-items: center; justify-content: center;
+  }
+  #btnPhotoClose svg { width: 22px; height: 22px; }
+  .pv-nav {
+    position: absolute; top: 50%; transform: translateY(-50%); z-index: 2;
+    width: 44px; height: 64px; border: none; cursor: pointer; color: #fff; font-size: 34px; line-height: 1;
+    background: rgba(0,0,0,.32); display: flex; align-items: center; justify-content: center;
+  }
+  .pv-nav:disabled { opacity: 0; pointer-events: none; }
+  #pvPrev { left: 0; border-radius: 0 8px 8px 0; }
+  #pvNext { right: 0; border-radius: 8px 0 0 8px; }
   #photoView .bar {
-    display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+    display: flex; flex-direction: column; gap: 8px; padding: 12px 14px;
     padding-bottom: calc(12px + env(safe-area-inset-bottom)); color: #e2e8f0; font-size: 13px;
   }
-  #photoView .bar span { flex: 1; }
+  #photoViewCap { color: #94a3b8; }
+  #pvCaption {
+    width: 100%; padding: 9px 11px; font-size: 14px; border-radius: 8px;
+    border: 1px solid #334155; background: #1e293b; color: #f1f5f9;
+  }
+  body.viewer #pvCaption[readonly] { border-color: transparent; background: transparent; padding-left: 0; color: #f1f5f9; font-size: 15px; }
+  #pvCaption[readonly]:placeholder-shown { display: none; }
+  .bar-actions { display: flex; justify-content: flex-end; }
+  body.viewer .bar-actions { display: none; }
   #toast {
     position: fixed; left: 50%; bottom: 100px; transform: translateX(-50%);
     background: #0f172a; color: #fff; padding: 10px 18px; border-radius: 999px;
@@ -169,6 +192,31 @@
     border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 1.5px #fff;
   }
   .gal-empty { text-align: center; color: var(--muted); font-size: 14px; padding: 60px 24px; }
+  /* gallery toolbar (owner select mode) */
+  .gal-toolbar { display: flex; align-items: center; gap: 8px; padding: 8px 2px 6px; position: sticky; top: 0; background: #f8fafc; z-index: 3; }
+  .gal-toolbar .spacer { flex: 1; font-size: 13px; color: var(--muted); }
+  .gal-toolbar .btn { padding: 7px 13px; font-size: 13px; border-radius: 8px; border: none; cursor: pointer; }
+  /* day notes */
+  .gal-note { margin: 0 2px 10px; }
+  .gal-note-text { font-size: 13px; color: #475569; line-height: 1.45; white-space: pre-wrap; cursor: text; }
+  .gal-note-add { background: none; border: none; color: var(--teal); font-size: 13px; padding: 0; cursor: pointer; }
+  .gal-note textarea {
+    width: 100%; font: inherit; font-size: 13px; color: #334155; border: 1px solid var(--line);
+    border-radius: 8px; padding: 7px 9px; resize: vertical; min-height: 40px; background: #fff;
+  }
+  /* caption overlay + selection */
+  .gal-cell .cap {
+    position: absolute; left: 0; right: 0; bottom: 0; padding: 14px 6px 4px; font-size: 11px; color: #fff;
+    background: linear-gradient(transparent, rgba(0,0,0,.72)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .gal-cell .chk {
+    position: absolute; top: 5px; left: 5px; width: 20px; height: 20px; border-radius: 50%;
+    border: 2px solid #fff; background: rgba(0,0,0,.35); display: none; align-items: center; justify-content: center;
+    color: #fff; font-size: 12px; line-height: 1;
+  }
+  #gallery.selecting .gal-cell .chk { display: flex; }
+  .gal-cell.sel { outline: 3px solid var(--teal); outline-offset: -3px; }
+  .gal-cell.sel .chk { background: var(--teal); border-color: var(--teal); }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -260,11 +308,18 @@
 </dialog>
 
 <div id="photoView">
-  <img id="photoViewImg" alt="">
+  <button id="btnPhotoClose" aria-label="Close">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
+  </button>
+  <button id="pvPrev" class="pv-nav" aria-label="Previous">‹</button>
+  <button id="pvNext" class="pv-nav" aria-label="Next">›</button>
+  <div id="pvStage"><img id="photoViewImg" alt=""></div>
   <div class="bar">
-    <span id="photoViewCap"></span>
-    <button class="btn btn-warn" id="btnPhotoDelete">Delete</button>
-    <button class="btn btn-ghost" id="btnPhotoClose">Close</button>
+    <div id="photoViewCap"></div>
+    <input id="pvCaption" type="text" maxlength="200" placeholder="Add a caption…">
+    <div class="bar-actions">
+      <button class="btn btn-warn" id="btnPhotoDelete">Delete</button>
+    </div>
   </div>
 </div>
 

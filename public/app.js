@@ -203,6 +203,23 @@ function renderAll() { renderMap(); renderStrip(); if (currentView === "gallery"
 
 /* ---------------- gallery / timeline view ---------------- */
 let currentView = "map"; // "map" | "gallery"
+let selectMode = false;                 // owner batch-select in gallery
+const selectedIds = new Set();
+let viewerDayNotes = {};                 // day notes when viewing a shared trip
+
+function currentTrip() { return trips.find(t => t.id === currentTripId); }
+function getDayNote(key) {
+  if (viewerMode) return viewerDayNotes[key] || "";
+  return (currentTrip()?.dayNotes || {})[key] || "";
+}
+async function setDayNote(key, text) {
+  const trip = currentTrip(); if (!trip) return;
+  trip.dayNotes = trip.dayNotes || {};
+  const v = (text || "").trim();
+  if (v) trip.dayNotes[key] = v; else delete trip.dayNotes[key];
+  await idb.put("trips", trip);
+  markDirtyAndSync(currentTripId);
+}
 function dayLabel(ts) {
   if (!ts) return "Undated";
   return new Date(ts).toLocaleDateString(undefined,
@@ -213,11 +230,88 @@ function dayKey(ts) {
   const d = new Date(ts);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
+function fillDayNote(wrap, key) {
+  wrap.innerHTML = "";
+  const note = getDayNote(key);
+  if (viewerMode) {
+    if (note) { const d = document.createElement("div"); d.className = "gal-note-text"; d.textContent = note; wrap.appendChild(d); }
+    return;
+  }
+  if (note) {
+    const d = document.createElement("div"); d.className = "gal-note-text"; d.textContent = note;
+    d.title = "Tap to edit"; d.onclick = () => editDayNote(wrap, key);
+    wrap.appendChild(d);
+  } else {
+    const add = document.createElement("button"); add.className = "gal-note-add"; add.textContent = "+ Add day note";
+    add.onclick = () => editDayNote(wrap, key);
+    wrap.appendChild(add);
+  }
+}
+function editDayNote(wrap, key) {
+  wrap.innerHTML = "";
+  const ta = document.createElement("textarea"); ta.rows = 2; ta.maxLength = 500;
+  ta.value = getDayNote(key); ta.placeholder = "Add a note for this day…";
+  ta.addEventListener("blur", async () => { await setDayNote(key, ta.value); fillDayNote(wrap, key); });
+  wrap.appendChild(ta); ta.focus();
+}
+function renderCell(p) {
+  const cell = document.createElement("div");
+  cell.className = "gal-cell" + (hasGeo(p) ? "" : " nogps") + (selectedIds.has(p.id) ? " sel" : "");
+  cell.title = hasGeo(p) ? fmtDate(p.ts) : "No location in this photo";
+  const img = document.createElement("img");
+  img.src = thumbUrl(p); img.loading = "lazy"; img.alt = p.name || "photo";
+  cell.appendChild(img);
+  if (p.caption) { const c = document.createElement("div"); c.className = "cap"; c.textContent = p.caption; cell.appendChild(c); }
+  const chk = document.createElement("div"); chk.className = "chk"; chk.textContent = selectedIds.has(p.id) ? "✓" : "";
+  cell.appendChild(chk);
+  cell.onclick = () => {
+    if (selectMode) {
+      if (selectedIds.has(p.id)) selectedIds.delete(p.id); else selectedIds.add(p.id);
+      cell.classList.toggle("sel"); chk.textContent = selectedIds.has(p.id) ? "✓" : "";
+      const cnt = document.querySelector(".gal-toolbar .spacer");
+      if (cnt) cnt.textContent = `${selectedIds.size} selected`;
+      const del = document.querySelector(".gal-toolbar .btn-warn");
+      if (del) del.disabled = selectedIds.size === 0;
+    } else openPhotoView(p);
+  };
+  return cell;
+}
+async function deleteSelected() {
+  if (!selectedIds.size) return;
+  const n = selectedIds.size;
+  if (!confirm(`Delete ${n} photo${n > 1 ? "s" : ""} from this trip?`)) return;
+  for (const pid of selectedIds) await idb.del("photos", pid);
+  selectMode = false; selectedIds.clear();
+  await loadPhotos(); renderAll();
+  markDirtyAndSync(currentTripId);
+  toast(`Deleted ${n} photo${n > 1 ? "s" : ""}`);
+}
 function renderGallery() {
   const g = $("gallery");
   g.innerHTML = "";
+  g.classList.toggle("selecting", selectMode);
+
+  // owner toolbar: Select / (Cancel · count · Delete)
+  if (!viewerMode) {
+    const tb = document.createElement("div"); tb.className = "gal-toolbar";
+    if (!selectMode) {
+      const spacer = document.createElement("div"); spacer.className = "spacer";
+      const sel = document.createElement("button"); sel.className = "btn btn-ghost"; sel.textContent = "Select";
+      sel.onclick = () => { if (!photos.length) return; selectMode = true; selectedIds.clear(); renderGallery(); };
+      tb.append(spacer, sel);
+    } else {
+      const cancel = document.createElement("button"); cancel.className = "btn btn-ghost"; cancel.textContent = "Cancel";
+      cancel.onclick = () => { selectMode = false; selectedIds.clear(); renderGallery(); };
+      const count = document.createElement("div"); count.className = "spacer"; count.textContent = `${selectedIds.size} selected`;
+      const del = document.createElement("button"); del.className = "btn btn-warn"; del.textContent = "Delete";
+      del.disabled = selectedIds.size === 0; del.onclick = deleteSelected;
+      tb.append(cancel, count, del);
+    }
+    g.appendChild(tb);
+  }
+
   if (!photos.length) {
-    g.innerHTML = '<div class="gal-empty">No photos yet.</div>';
+    g.insertAdjacentHTML("beforeend", '<div class="gal-empty">No photos yet.</div>');
     return;
   }
   // photos are already sorted ascending by time; group consecutively by day
@@ -226,27 +320,19 @@ function renderGallery() {
     const k = dayKey(p.ts);
     if (k !== curKey) {
       curKey = k;
-      const day = document.createElement("div");
-      day.className = "gal-day";
-      const h = document.createElement("h3");
-      h.textContent = dayLabel(p.ts);
-      grid = document.createElement("div");
-      grid.className = "gal-grid";
-      day.append(h, grid);
+      const day = document.createElement("div"); day.className = "gal-day";
+      const h = document.createElement("h3"); h.textContent = dayLabel(p.ts);
+      const note = document.createElement("div"); note.className = "gal-note"; fillDayNote(note, k);
+      grid = document.createElement("div"); grid.className = "gal-grid";
+      day.append(h, note, grid);
       g.appendChild(day);
     }
-    const cell = document.createElement("div");
-    cell.className = "gal-cell" + (hasGeo(p) ? "" : " nogps");
-    cell.title = hasGeo(p) ? fmtDate(p.ts) : "No location in this photo";
-    const img = document.createElement("img");
-    img.src = thumbUrl(p); img.loading = "lazy"; img.alt = p.name || "photo";
-    cell.appendChild(img);
-    cell.onclick = () => openPhotoView(p);
-    grid.appendChild(cell);
+    grid.appendChild(renderCell(p));
   }
 }
 function setView(view) {
   currentView = view;
+  if (view !== "gallery" && selectMode) { selectMode = false; selectedIds.clear(); }
   const gallery = view === "gallery";
   $("gallery").classList.toggle("hidden", !gallery);
   $("strip").style.display = gallery ? "none" : "";
@@ -278,6 +364,7 @@ function renderTripSelect() {
 }
 async function switchTrip(id) {
   currentTripId = id; await kvSet("currentTripId", id);
+  selectMode = false; selectedIds.clear();
   await loadPhotos(); renderTripSelect(); renderAll();
 }
 async function loadPhotos() {
@@ -379,28 +466,75 @@ async function drainInbox() {
   markDirtyAndSync(tripId);
 }
 
-/* ---------------- fullscreen photo ---------------- */
-let photoViewCurrent = null, photoViewUrl = null;
-async function openPhotoView(p) {
-  let src;
-  if (p.fullSrc) {
-    // viewer mode: full image served by CloudFront (signed cookie already set)
-    src = p.fullSrc;
-    if (photoViewUrl) { URL.revokeObjectURL(photoViewUrl); photoViewUrl = null; }
-  } else if (p.blob || p.thumb) {
-    if (photoViewUrl) URL.revokeObjectURL(photoViewUrl);
-    photoViewUrl = URL.createObjectURL(p.blob || p.thumb);
-    src = photoViewUrl;
-  } else { toast("Could not load this photo"); return; }
+/* ---------------- fullscreen photo (swipeable) ---------------- */
+let photoViewCurrent = null, photoViewUrl = null, photoViewIndex = 0;
+function showPhotoAt(i) {
+  if (i < 0 || i >= photos.length) return;
+  photoViewIndex = i;
+  const p = photos[i];
   photoViewCurrent = p;
+  if (photoViewUrl) { URL.revokeObjectURL(photoViewUrl); photoViewUrl = null; }
+  let src;
+  if (p.fullSrc) src = p.fullSrc;                       // viewer: CloudFront URL
+  else if (p.blob || p.thumb) { photoViewUrl = URL.createObjectURL(p.blob || p.thumb); src = photoViewUrl; }
+  else { toast("Could not load this photo"); return; }
   $("photoViewImg").src = src;
   $("photoViewCap").textContent = fmtDate(p.ts) + (hasGeo(p) ? "" : " · no location");
+  const cap = $("pvCaption");
+  cap.value = p.caption || "";
+  cap.readOnly = !!viewerMode;
+  cap.placeholder = viewerMode ? "" : "Add a caption…";
   $("btnPhotoDelete").style.display = viewerMode ? "none" : "";
+  $("pvPrev").disabled = i <= 0;
+  $("pvNext").disabled = i >= photos.length - 1;
   $("photoView").classList.add("open");
+}
+function openPhotoView(p) {
+  const i = photos.findIndex(x => x.id === p.id);
+  showPhotoAt(i >= 0 ? i : 0);
 }
 function closePhotoView() {
   $("photoView").classList.remove("open");
   if (photoViewUrl) { URL.revokeObjectURL(photoViewUrl); photoViewUrl = null; }
+}
+// wired once, works in both owner and viewer modes
+function initPhotoViewControls() {
+  $("btnPhotoClose").onclick = closePhotoView;
+  $("pvPrev").onclick = () => showPhotoAt(photoViewIndex - 1);
+  $("pvNext").onclick = () => showPhotoAt(photoViewIndex + 1);
+  document.addEventListener("keydown", e => {
+    if (!$("photoView").classList.contains("open")) return;
+    if (e.key === "Escape") closePhotoView();
+    else if (e.key === "ArrowLeft") showPhotoAt(photoViewIndex - 1);
+    else if (e.key === "ArrowRight") showPhotoAt(photoViewIndex + 1);
+  });
+  // swipe left/right on the image stage
+  const stage = $("pvStage");
+  let sx = 0, sy = 0, tracking = false;
+  stage.addEventListener("touchstart", e => {
+    const t = e.changedTouches[0]; sx = t.clientX; sy = t.clientY; tracking = true;
+  }, { passive: true });
+  stage.addEventListener("touchend", e => {
+    if (!tracking) return; tracking = false;
+    const t = e.changedTouches[0], dx = t.clientX - sx, dy = t.clientY - sy;
+    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5)
+      showPhotoAt(photoViewIndex + (dx < 0 ? 1 : -1));
+  }, { passive: true });
+  // caption editing (no-op in viewer mode)
+  const cap = $("pvCaption");
+  const saveCaption = async () => {
+    if (viewerMode || !photoViewCurrent) return;
+    const val = cap.value.trim();
+    if ((photoViewCurrent.caption || "") === val) return;
+    photoViewCurrent.caption = val;
+    await idb.put("photos", photoViewCurrent);
+    const idx = photos.findIndex(x => x.id === photoViewCurrent.id);
+    if (idx >= 0) photos[idx].caption = val;
+    if (currentView === "gallery") renderGallery();
+    markDirtyAndSync(currentTripId);
+  };
+  cap.addEventListener("change", saveCaption);
+  cap.addEventListener("blur", saveCaption);
 }
 
 /* ---------------- publish / share ---------------- */
@@ -418,7 +552,8 @@ async function publishTrip(pass) {
         tripId: trip.published?.id || null,
         password: pass,
         name: trip.name,
-        photos: list.map(p => ({ id: p.id, name: p.name, ts: p.ts, lat: p.lat, lng: p.lng })),
+        photos: list.map(p => ({ id: p.id, name: p.name, ts: p.ts, lat: p.lat, lng: p.lng, caption: p.caption || "" })),
+        dayNotes: trip.dayNotes || {},
         need: list.map(p => p.id),
       }),
     });
@@ -502,7 +637,8 @@ async function syncPublishedTrip(trip) {
         tripId: pub.id,
         password: pub.password,
         name: trip.name,
-        photos: list.map(p => ({ id: p.id, name: p.name, ts: p.ts, lat: p.lat, lng: p.lng })),
+        photos: list.map(p => ({ id: p.id, name: p.name, ts: p.ts, lat: p.lat, lng: p.lng, caption: p.caption || "" })),
+        dayNotes: trip.dayNotes || {},
         need,
       }),
     });
@@ -542,10 +678,8 @@ async function startViewer(tripId) {
   $("viewerTitle").textContent = "Shared trip";
   $("emptyHint").innerHTML = "Enter the password to view this shared trip.";
 
-  // wire the fullscreen photo viewer's Close button (owner-mode wiring in
-  // main() never runs here because viewer mode returns early)
-  $("btnPhotoClose").onclick = closePhotoView;
-  $("photoView").addEventListener("click", ev => { if (ev.target.id === "photoView") closePhotoView(); });
+  // (fullscreen viewer controls are wired in initPhotoViewControls, before the
+  // viewer branch in main(), so nav/swipe/close work here too)
 
   // remember the password for this trip for 48h so viewers aren't re-prompted
   const PASS_KEY = "rtpass_" + tripId, PASS_TTL = 48 * 60 * 60 * 1000;
@@ -584,6 +718,7 @@ async function startViewer(tripId) {
       savePass(pass);
       const data = await r.json();
       viewerMode = { id: tripId, pass, name: data.name };
+      viewerDayNotes = data.dayNotes || {};
       $("viewerTitle").textContent = data.name;
       document.title = data.name + " — Roadtrip Map";
       // no per-image fetching: thumbnails + full photos are plain CDN URLs, the
@@ -619,9 +754,10 @@ async function main() {
     throw new Error("EXIF library failed to load — check your connection and reload");
   initMap();
 
-  // Map / Gallery toggle — wired in both owner and viewer modes
+  // Map / Gallery toggle + fullscreen viewer controls — wired in both modes
   $("tabMap").onclick = () => setView("map");
   $("tabGallery").onclick = () => setView("gallery");
+  initPhotoViewControls();
 
   const viewerTripId = parseViewerHash();
   if (viewerTripId) { await startViewer(viewerTripId); return; }
@@ -660,14 +796,14 @@ async function main() {
     if (pass.length < 4) { toast("Password must be at least 4 characters"); return; }
     publishTrip(pass);
   };
-  $("btnPhotoClose").onclick = closePhotoView;
   $("btnPhotoDelete").onclick = async () => {
     if (!photoViewCurrent || viewerMode) return;
     await idb.del("photos", photoViewCurrent.id);
-    closePhotoView();
     await loadPhotos(); renderAll();
-    toast("Photo removed");
     markDirtyAndSync(currentTripId);
+    if (!photos.length) { closePhotoView(); toast("Photo removed"); return; }
+    showPhotoAt(Math.min(photoViewIndex, photos.length - 1));
+    toast("Photo removed");
   };
   // re-check inbox when returning to the app (e.g. right after sharing photos)
   document.addEventListener("visibilitychange", () => {
