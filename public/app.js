@@ -118,6 +118,7 @@ async function processFile(fileBlob, name, tripId) {
 /* ---------------- state ---------------- */
 let trips = [], currentTripId = null, photos = [];   // photos = current trip, sorted
 let map, markerLayer, routeLine, trackLine, markersById = {};
+let baseTiles = null, darkTiles = null;   // CARTO Voyager (light) / dark_all (dark)
 const objUrls = new Map(); // photoId -> object URL (thumbs)
 let viewerMode = null; // { id, pass, name } when viewing a shared trip
 let account = null;    // { username, initials, name } when logged in as owner
@@ -221,15 +222,37 @@ function updateRouteStatus() {
   el.textContent = n ? `· ${n} points imported` : "· none yet";
 }
 
+/* ---------------- theme (light / dark) ---------------- */
+function currentTheme() { return document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light"; }
+function updateThemeButton(t) {
+  const b = document.getElementById("btnTheme"); if (!b) return;
+  // show the icon for the mode you'll switch TO
+  b.innerHTML = t === "dark"
+    ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.2M12 19.3v2.2M4.6 4.6l1.6 1.6M17.8 17.8l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.6 19.4l1.6-1.6M17.8 6.2l1.6-1.6"/></svg>'
+    : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
+  b.title = t === "dark" ? "Switch to light" : "Switch to dark";
+}
+function applyTheme(t) {
+  document.documentElement.setAttribute("data-theme", t);
+  try { localStorage.setItem("rt_theme", t); } catch (e) {}
+  if (map) {
+    if (t === "dark") { if (baseTiles && map.hasLayer(baseTiles)) map.removeLayer(baseTiles); if (darkTiles && !map.hasLayer(darkTiles)) darkTiles.addTo(map); }
+    else { if (darkTiles && map.hasLayer(darkTiles)) map.removeLayer(darkTiles); if (baseTiles && !map.hasLayer(baseTiles)) baseTiles.addTo(map); }
+  }
+  updateThemeButton(t);
+}
+function toggleTheme() { applyTheme(currentTheme() === "dark" ? "light" : "dark"); }
+
 /* ---------------- map ---------------- */
 function initMap() {
   map = L.map("map", { zoomControl: false }).setView([48.8, 16.6], 5);
   L.control.zoom({ position: "bottomright" }).addTo(map);
-  // CARTO Voyager — muted, no API key, so photos + the route line pop
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
-    subdomains: "abcd", maxZoom: 20,
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
-  }).addTo(map);
+  // CARTO basemaps — muted so photos + the route line pop. Voyager for light,
+  // dark_all for the night theme; no API key needed for either.
+  const cartoAttr = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>';
+  baseTiles = L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", { subdomains: "abcd", maxZoom: 20, attribution: cartoAttr });
+  darkTiles = L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/dark_all/{z}/{x}/{y}{r}.png", { subdomains: "abcd", maxZoom: 20, attribution: cartoAttr });
+  (currentTheme() === "dark" ? darkTiles : baseTiles).addTo(map);
   // cluster nearby photo pins into a count bubble (fall back if the CDN failed)
   markerLayer = (typeof L.markerClusterGroup === "function")
     ? L.markerClusterGroup({ maxClusterRadius: 46, disableClusteringAtZoom: 16, showCoverageOnHover: false, spiderfyOnMaxZoom: true })
@@ -1160,6 +1183,9 @@ async function main() {
   // trip summary — available to owner and viewers alike
   $("btnStats").onclick = () => { renderStats(); $("dlgStats").showModal(); };
   $("btnStatsClose").onclick = () => $("dlgStats").close();
+  // light / dark theme toggle — available in both modes
+  updateThemeButton(currentTheme());
+  $("btnTheme").onclick = toggleTheme;
 
   const viewerTripId = parseViewerHash();
   if (viewerTripId) { await startViewer(viewerTripId); return; }

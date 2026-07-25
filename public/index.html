@@ -5,6 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Roadtrip Map</title>
 <meta name="theme-color" content="#C65D3B">
+<script>
+  /* set the theme before first paint (avoids a light flash in dark mode) */
+  (function(){ try{
+    var p = localStorage.getItem("rt_theme");
+    var dark = p ? p === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+  }catch(e){ document.documentElement.setAttribute("data-theme","light"); } })();
+</script>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/icons/icon-192.png">
 <link rel="apple-touch-icon" href="/icons/icon-192.png">
@@ -25,6 +33,24 @@
     --shadow-lg: 0 12px 32px rgba(43,38,34,.16);
     --radius: 14px; --radius-sm: 10px; --radius-lg: 20px;
   }
+  /* --- Warm Editorial: night variant --- */
+  :root[data-theme="dark"] {
+    --paper: #1A1613; --surface: #221D18; --surface-2: #2C2620;
+    --primary: #D2694A; --primary-2: #E28A63; --primary-dark: #B04E30;
+    --ink: #F1EAE0; --muted: #A99F93; --line: #3A322B;
+    --success: #6FA07C; --warn: #D9A63E; --danger: #E0776B;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.45);
+    --shadow-md: 0 4px 14px rgba(0,0,0,.5);
+    --shadow-lg: 0 14px 36px rgba(0,0,0,.65);
+  }
+  /* pieces that hard-code a light-ish colour need a dark counterpart */
+  :root[data-theme="dark"] #map { background: #12100D; }
+  :root[data-theme="dark"] #busy { background: rgba(20,17,13,.82); }
+  :root[data-theme="dark"] #toast,
+  :root[data-theme="dark"] #placeBanner { background: var(--surface-2); color: var(--ink); border: 1px solid var(--line); }
+  :root[data-theme="dark"] .gal-note-text { color: #C9BEB0; }
+  :root[data-theme="dark"] .leaflet-popup-content-wrapper,
+  :root[data-theme="dark"] .leaflet-popup-tip { background: var(--surface); color: var(--ink); }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; overscroll-behavior: none; }
   body {
@@ -359,6 +385,7 @@
   </div>
   <select id="tripSelect" title="Current trip"></select>
   <div id="viewerTitle"></div>
+  <button class="btn-icon" id="btnTheme" title="Toggle dark mode" aria-label="Toggle dark mode"></button>
   <button class="btn-icon" id="btnStats" title="Trip summary" aria-label="Trip summary">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16"/><circle cx="12" cy="7.6" r="0.9" fill="currentColor" stroke="none"/></svg>
   </button>
