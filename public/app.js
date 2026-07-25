@@ -1,5 +1,6 @@
-/* Roadtrip Map — app logic. Local-first: everything lives in IndexedDB on this
-   device. Publishing uploads a copy to S3 (presigned direct upload); viewers
+/* Roadtrip Map — app logic. Cloud-first: the trip list and each trip's photos
+   live in S3 + DynamoDB; IndexedDB is a working cache for the device that made
+   the edits. Publishing uploads a copy to S3 (presigned direct upload); viewers
    authenticate once (/api/auth) and load images straight from CloudFront. */
 "use strict";
 
@@ -224,10 +225,16 @@ function updateRouteStatus() {
 function initMap() {
   map = L.map("map", { zoomControl: false }).setView([48.8, 16.6], 5);
   L.control.zoom({ position: "bottomright" }).addTo(map);
-  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 19, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+  // CARTO Voyager — muted, no API key, so photos + the route line pop
+  L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
+    subdomains: "abcd", maxZoom: 20,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
   }).addTo(map);
-  markerLayer = L.layerGroup().addTo(map);
+  // cluster nearby photo pins into a count bubble (fall back if the CDN failed)
+  markerLayer = (typeof L.markerClusterGroup === "function")
+    ? L.markerClusterGroup({ maxClusterRadius: 46, disableClusteringAtZoom: 16, showCoverageOnHover: false, spiderfyOnMaxZoom: true })
+    : L.layerGroup();
+  markerLayer.addTo(map);
   map.on("click", onMapClick);
 }
 
@@ -266,8 +273,8 @@ function renderMap() {
   for (const p of located) {
     pts.push([p.lat, p.lng]);
     const icon = L.divIcon({
-      className: "", iconSize: [44, 44], iconAnchor: [22, 40], popupAnchor: [0, -40],
-      html: `<div class="photo-marker" style="background-image:url('${thumbUrl(p)}')"></div>`
+      className: "", iconSize: [46, 52], iconAnchor: [23, 52], popupAnchor: [0, -50],
+      html: `<div class="photo-pin" style="background-image:url('${thumbUrl(p)}')"></div>`
     });
     const m = L.marker([p.lat, p.lng], { icon }).addTo(markerLayer);
     m.bindPopup(() => {
@@ -284,11 +291,18 @@ function renderMap() {
     markersById[p.id] = m;
   }
   if (track.length >= 2) {
-    // real driven route from Google Timeline — solid line, replaces the
-    // straight-line connector; markers still sit on top
-    trackLine = L.polyline(track, { color: "#0e7490", weight: 4, opacity: .8 }).addTo(map);
+    // real driven route from Google Timeline — solid terracotta line with a
+    // white casing underneath so it reads against the map; markers sit on top
+    trackLine = L.layerGroup([
+      L.polyline(track, { color: "#ffffff", weight: 8, opacity: .75, lineCap: "round", lineJoin: "round" }),
+      L.polyline(track, { color: "#C65D3B", weight: 4, opacity: 1, lineCap: "round", lineJoin: "round" }),
+    ]).addTo(map);
   } else if (pts.length >= 2) {
-    routeLine = L.polyline(pts, { color: "#0e7490", weight: 3.5, opacity: .85, dashArray: "8 7" }).addTo(map);
+    // no imported route — dashed terracotta connector between photos
+    routeLine = L.layerGroup([
+      L.polyline(pts, { color: "#ffffff", weight: 6, opacity: .6, lineCap: "round", lineJoin: "round" }),
+      L.polyline(pts, { color: "#C65D3B", weight: 3.5, opacity: .95, dashArray: "8 7", lineCap: "round", lineJoin: "round" }),
+    ]).addTo(map);
   }
   const all = pts.concat(track);
   if (all.length) map.fitBounds(L.latLngBounds(all), { padding: [50, 50], maxZoom: 14 });
@@ -380,7 +394,7 @@ function renderCell(p) {
   img.src = thumbUrl(p); img.loading = "lazy"; img.alt = p.name || "photo";
   cell.appendChild(img);
   if (p.caption) { const c = document.createElement("div"); c.className = "cap"; c.textContent = p.caption; cell.appendChild(c); }
-  if (p.uploadedBy) { const bd = document.createElement("div"); bd.className = "up-badge"; bd.textContent = p.uploadedBy; cell.appendChild(bd); }
+  if (p.uploadedBy) { const bd = document.createElement("div"); bd.className = "up-badge" + (p.uploadedBy.toUpperCase() === "L" ? " l" : ""); bd.textContent = p.uploadedBy; cell.appendChild(bd); }
   const chk = document.createElement("div"); chk.className = "chk"; chk.textContent = selectedIds.has(p.id) ? "✓" : "";
   cell.appendChild(chk);
   cell.onclick = () => {
@@ -679,6 +693,77 @@ function promptName(title, initial, cb) {
     dlg.close(); cb(v);
   };
   $("btnNameCancel").onclick = () => dlg.close();
+}
+
+/* ---------------- trip summary (stats) ---------------- */
+function haversineKm(a, b) {
+  const R = 6371, toR = x => x * Math.PI / 180;
+  const dLat = toR(b[0] - a[0]), dLng = toR(b[1] - a[1]);
+  const s = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toR(a[0])) * Math.cos(toR(b[0])) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
+}
+function fmtKm(km) {
+  if (!km) return "0 km";
+  return (km < 10 ? km.toFixed(1) : Math.round(km).toLocaleString()) + " km";
+}
+function computeStats() {
+  const located = photos.filter(hasGeo);
+  const dated = photos.filter(p => p.ts).sort((a, b) => a.ts - b.ts);
+  const days = new Set(dated.map(p => dayKey(p.ts))).size;
+  let t = 0, l = 0, other = 0;
+  for (const p of photos) {
+    const u = (p.uploadedBy || "").toUpperCase();
+    if (u === "T") t++; else if (u === "L") l++; else other++;
+  }
+  const range = dated.length ? { from: dated[0].ts, to: dated[dated.length - 1].ts } : null;
+  // furthest point from the first located photo (chronologically)
+  let furthest = 0;
+  if (located.length) {
+    const chrono = located.slice().sort((a, b) => (a.ts ?? Infinity) - (b.ts ?? Infinity));
+    const start = [chrono[0].lat, chrono[0].lng];
+    for (const p of chrono) { const d = haversineKm(start, [p.lat, p.lng]); if (d > furthest) furthest = d; }
+  }
+  // km — real driven route if available, else straight-line between photos
+  const track = tripTrack();
+  let km = 0, approx = false;
+  if (track.length >= 2) {
+    for (let i = 1; i < track.length; i++) km += haversineKm(track[i - 1], track[i]);
+  } else if (located.length >= 2) {
+    approx = true;
+    const chrono = located.slice().sort((a, b) => (a.ts ?? Infinity) - (b.ts ?? Infinity));
+    for (let i = 1; i < chrono.length; i++) km += haversineKm([chrono[i - 1].lat, chrono[i - 1].lng], [chrono[i].lat, chrono[i].lng]);
+  }
+  return { days, total: photos.length, located: located.length, t, l, other, range, furthest, km, approx };
+}
+function fmtDay(ts) {
+  return new Date(ts).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
+function renderStats() {
+  const s = computeStats();
+  const box = $("statsBody");
+  if (!s.total) { box.innerHTML = '<div class="stats-empty">No photos in this trip yet.</div>'; return; }
+
+  const esc = str => String(str).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const dateRange = s.range
+    ? (fmtDay(s.range.from) === fmtDay(s.range.to) ? fmtDay(s.range.from) : `${fmtDay(s.range.from)} – ${fmtDay(s.range.to)}`)
+    : "No dates in photos";
+  const kmSub = s.km ? (s.approx ? "≈ straight-line between photos" : "driven (from Timeline)") : "add located photos or a route";
+
+  const split = [];
+  if (s.t) split.push(`<span class="split-pill">T · ${s.t}</span>`);
+  if (s.l) split.push(`<span class="split-pill l">L · ${s.l}</span>`);
+  if (s.other) split.push(`<span class="split-pill o">other · ${s.other}</span>`);
+
+  box.innerHTML = `
+    <div class="stat-grid">
+      <div class="stat"><div class="k">Days</div><div class="v">${s.days || "—"}</div></div>
+      <div class="stat"><div class="k">Photos</div><div class="v">${s.total}</div><div class="sub">${s.located} on the map</div></div>
+      <div class="stat"><div class="k">Distance</div><div class="v">${s.km ? fmtKm(s.km) : "—"}</div><div class="sub">${kmSub}</div></div>
+      <div class="stat"><div class="k">Furthest point</div><div class="v">${s.located ? fmtKm(s.furthest) : "—"}</div><div class="sub">from the start</div></div>
+      <div class="stat wide"><div class="k">Dates</div><div class="v" style="font-size:17px">${esc(dateRange)}</div></div>
+      <div class="stat wide"><div class="k">Who added</div><div class="stat-split">${split.join("") || '<span class="sub">—</span>'}</div></div>
+    </div>`;
 }
 
 /* ---------------- import ---------------- */
@@ -1072,6 +1157,9 @@ async function main() {
   $("tabMap").onclick = () => setView("map");
   $("tabGallery").onclick = () => setView("gallery");
   initPhotoViewControls();
+  // trip summary — available to owner and viewers alike
+  $("btnStats").onclick = () => { renderStats(); $("dlgStats").showModal(); };
+  $("btnStatsClose").onclick = () => $("dlgStats").close();
 
   const viewerTripId = parseViewerHash();
   if (viewerTripId) { await startViewer(viewerTripId); return; }
