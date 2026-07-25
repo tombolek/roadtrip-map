@@ -361,6 +361,27 @@ let selectMode = false;                 // owner batch-select in gallery
 const selectedIds = new Set();
 let viewerDayNotes = {};                 // day notes when viewing a shared trip
 let viewerTrack = [];                     // real route [[lat,lng]...] when viewing a shared trip
+let viewerDayPlaces = {};                // day -> town when viewing a shared trip
+let viewerShowPlaces = true;             // whether the shared trip shows place-names
+
+// day place-names (town per day, reverse-geocoded server-side)
+function placesEnabled() {
+  return viewerMode ? viewerShowPlaces !== false : (currentTrip()?.showPlaces !== false);
+}
+function getDayPlace(key) {
+  const src = viewerMode ? viewerDayPlaces : (currentTrip()?.dayPlaces || {});
+  return src[key] || "";
+}
+// one representative point per day (first located photo; list is time-sorted)
+function computeDayPoints(list) {
+  const out = {};
+  for (const p of list) {
+    if (!hasGeo(p) || !p.ts) continue;
+    const k = dayKey(p.ts);
+    if (!out[k]) out[k] = [p.lat, p.lng];
+  }
+  return out;
+}
 
 function currentTrip() { return trips.find(t => t.id === currentTripId); }
 function getDayNote(key) {
@@ -477,7 +498,9 @@ function renderGallery() {
     if (k !== curKey) {
       curKey = k;
       const day = document.createElement("div"); day.className = "gal-day";
-      const h = document.createElement("h3"); h.textContent = dayLabel(p.ts);
+      const h = document.createElement("h3");
+      const place = placesEnabled() ? getDayPlace(k) : "";
+      h.textContent = place ? `${dayLabel(p.ts)} · ${place}` : dayLabel(p.ts);
       const note = document.createElement("div"); note.className = "gal-note"; fillDayNote(note, k);
       grid = document.createElement("div"); grid.className = "gal-grid";
       day.append(h, note, grid);
@@ -539,6 +562,7 @@ async function loadTripFromCloud(trip) {
     if (!r.ok) return;
     const data = await r.json();
     trip.name = data.name; trip.dayNotes = data.dayNotes || {}; trip.track = data.track || [];
+    trip.dayPlaces = data.dayPlaces || {}; trip.showPlaces = data.showPlaces !== false;
     const serverIds = new Set((data.photos || []).map(p => p.id));
     const local = await idb.byIndex("photos", "tripId", trip.id);
     const localById = new Map(local.map(p => [p.id, p]));
@@ -920,6 +944,7 @@ async function publishTrip(viewPassword) {
         tripId: trip.published.id, viewPassword, name: trip.name,
         photos: list.map(p => ({ id: p.id, name: p.name, ts: p.ts, lat: p.lat, lng: p.lng, caption: p.caption || "", uploadedBy: p.uploadedBy || "" })),
         dayNotes: trip.dayNotes || {}, track: trip.track || [], need: [],
+        dayPoints: computeDayPoints(list), showPlaces: trip.showPlaces !== false,
       }),
     });
     if (r.status === 401) { busy(false); toast("Please log in again"); return; }
@@ -1003,11 +1028,17 @@ async function syncPublishedTrip(trip) {
         dayNotes: trip.dayNotes || {},
         track: trip.track || [],
         need,
+        dayPoints: computeDayPoints(list), showPlaces: trip.showPlaces !== false,
       }),
     });
     if (r.status === 401) { syncInFlight = false; return; } // session expired; leave dirty, will retry
     if (!r.ok) throw new Error("meta sync failed " + r.status);
-    const { uploads } = await r.json();
+    const data = await r.json();
+    const { uploads } = data;
+    // refresh cached day place-names from the server (it just geocoded new days)
+    if (data.dayPlaces) trip.dayPlaces = data.dayPlaces;
+    if (typeof data.showPlaces === "boolean") trip.showPlaces = data.showPlaces;
+    if (trip.id === currentTripId && currentView === "gallery") renderGallery();
     const ok = await uploadAllPairs(list.filter(p => need.includes(p.id)), uploads);
     if (!ok) throw new Error("photo sync failed");
     pub.uploadedIds = list.map(p => p.id);   // meta already dropped removed photos server-side
@@ -1083,6 +1114,8 @@ async function startViewer(tripId) {
       viewerMode = { id: tripId, pass, name: data.name };
       viewerDayNotes = data.dayNotes || {};
       viewerTrack = Array.isArray(data.track) ? data.track : [];
+      viewerDayPlaces = data.dayPlaces || {};
+      viewerShowPlaces = data.showPlaces !== false;
       $("viewerTitle").textContent = data.name;
       document.title = data.name + " — Roadtrip Map";
       // no per-image fetching: thumbnails + full photos are plain CDN URLs, the
@@ -1212,7 +1245,15 @@ async function main() {
   $("tripSelect").onchange = e => switchTrip(e.target.value);
   $("btnAdd").onclick = () => $("filePick").click();
   $("filePick").onchange = e => { importFiles([...e.target.files]); e.target.value = ""; };
-  $("btnTrips").onclick = () => { renderTripList(); updateRouteStatus(); $("dlgTrips").showModal(); };
+  $("btnTrips").onclick = () => { renderTripList(); updateRouteStatus(); $("chkPlaces").checked = currentTrip()?.showPlaces !== false; $("dlgTrips").showModal(); };
+  $("chkPlaces").onchange = async (e) => {
+    const trip = currentTrip(); if (!trip) return;
+    trip.showPlaces = e.target.checked;
+    await idb.put("trips", trip);
+    if (currentView === "gallery") renderGallery();
+    markDirtyAndSync(currentTripId);   // re-syncs; server geocodes when enabling
+    toast(e.target.checked ? "Place names on — towns will appear as it syncs" : "Place names off");
+  };
   $("btnImportTimeline").onclick = () => $("timelinePick").click();
   $("timelinePick").onchange = e => { const f = e.target.files[0]; e.target.value = ""; if (f) importTimelineFile(f); };
   $("btnClearTimeline").onclick = clearTimeline;

@@ -189,6 +189,8 @@
   .route-status { font-weight: 400; color: var(--muted); }
   .route-actions { display: flex; gap: 8px; flex-wrap: wrap; }
   .route-hint { font-size: 12px; color: var(--muted); margin-top: 8px; line-height: 1.45; }
+  .place-toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink); margin-top: 12px; cursor: pointer; }
+  .place-toggle input { width: 16px; height: 16px; accent-color: var(--primary); }
   #shareResult { display: none; }
   .fld-label { display: block; font-size: 12px; color: var(--muted); margin: 6px 2px 5px; font-weight: 600; }
   .share-box {
@@ -434,6 +436,7 @@
       <button class="btn btn-ghost" id="btnClearTimeline">Clear route</button>
     </div>
     <div class="route-hint">Export on your phone: Settings → Location → Timeline → Export, then pick that JSON file here.</div>
+    <label class="place-toggle"><input type="checkbox" id="chkPlaces"> Show place names (town) on each day</label>
   </div>
   <div class="dlg-actions">
     <button class="btn btn-ghost" id="btnTripsClose">Close</button>
